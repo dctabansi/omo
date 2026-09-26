@@ -1,0 +1,9 @@
+[package]
+name = "omo"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, one-mode-only terminal text editor."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dctabansi/omo"
+
+[dependencies]
