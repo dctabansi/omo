@@ -18,6 +18,13 @@ impl From<&str> for Row {
     }
 }
 
+impl Row {
+    /// Returns a UTF-8 character-safe horizontal slice of the row for viewport rendering.
+    pub fn slice_chars(&self, col_offset: usize, max_cols: usize) -> String {
+        self.text.chars().skip(col_offset).take(max_cols).collect()
+    }
+}
+
 /// Holds the entirety of a text buffer.
 #[derive(Default)]
 pub struct Buffer {
@@ -28,6 +35,14 @@ impl Buffer {
     /// Creates a new empty buffer.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a buffer populated from a slice of string lines.
+    #[allow(dead_code)]
+    pub fn from_lines(lines: &[&str]) -> Self {
+        Self {
+            rows: lines.iter().copied().map(Row::from).collect(),
+        }
     }
 
     /// Loads a buffer from a file path.
@@ -54,8 +69,27 @@ impl Buffer {
     }
 
     /// Returns true if the buffer is empty.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_tracks_character_count_for_utf8() {
+        let row = Row::from("héllo 🦀 world");
+        assert_eq!(row.len, 13);
+        assert!(row.text.len() > row.len);
+    }
+
+    #[test]
+    fn row_slice_chars_handles_multibyte_boundaries_safely() {
+        let row = Row::from("αβγ🦀δεζ");
+        assert_eq!(row.slice_chars(0, 4), "αβγ🦀");
+        assert_eq!(row.slice_chars(2, 3), "γ🦀δ");
+        assert_eq!(row.slice_chars(10, 5), "");
     }
 }
