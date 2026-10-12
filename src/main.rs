@@ -12,7 +12,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     let buffer = if args.len() > 1 {
-        Buffer::open(&args[1]).unwrap_or_else(|_| Buffer::new())
+        Buffer::open(&args[1]).unwrap_or_else(|_| Buffer::with_filename(&args[1]))
     } else {
         Buffer::new()
     };
