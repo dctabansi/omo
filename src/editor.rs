@@ -3,12 +3,15 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     queue,
-    style::{Attribute, Print, SetAttribute},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{Clear, ClearType},
 };
 use std::io::{Write, stdout};
 
 use crate::buffer::Buffer;
+use crate::config::{Action, Config};
 use crate::terminal::Terminal;
 
 const TAB_STOP: usize = 4;
@@ -16,12 +19,32 @@ const TAB_STOP: usize = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptState {
     None,
-    SaveAs { input: String },
+    SaveAs {
+        input: String,
+    },
+    Search {
+        query: String,
+        saved_cx: usize,
+        saved_cy: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorCommand {
+    Action(Action),
+    Move(KeyCode),
+    InsertChar(char),
+    InsertNewline,
+    Backspace,
+    Delete,
+    InsertTab,
+    Noop,
 }
 
 pub struct Editor {
     should_quit: bool,
     buffer: Buffer,
+    pub config: Config,
     cx: usize,
     cy: usize,
     desired_cx: usize,
@@ -33,10 +56,16 @@ pub struct Editor {
 }
 
 impl Editor {
+    #[allow(dead_code)]
     pub fn new(buffer: Buffer) -> Self {
+        Self::with_config(buffer, Config::default())
+    }
+
+    pub fn with_config(buffer: Buffer, config: Config) -> Self {
         Self {
             should_quit: false,
             buffer,
+            config,
             cx: 0,
             cy: 0,
             desired_cx: 0,
@@ -101,6 +130,9 @@ impl Editor {
 
         let left = match &self.prompt {
             PromptState::SaveAs { input } => format!(" Save as: {input}"),
+            PromptState::Search { query, .. } => {
+                format!(" Search (Esc to cancel, arrows/Enter to jump): {query}")
+            }
             PromptState::None => {
                 let name = self.buffer.filename.as_deref().unwrap_or("[No Name]");
                 let dirty = if self.buffer.dirty { " [+]" } else { "" };
@@ -255,7 +287,7 @@ impl Editor {
         }
     }
 
-    /// Handles a quit request, requiring a second consecutive Ctrl+Q when dirty.
+    /// Handles a quit request, requiring a second consecutive Quit action when dirty.
     pub fn trigger_quit(&mut self) {
         if self.buffer.dirty && !self.quit_confirm_pending {
             self.quit_confirm_pending = true;
@@ -266,65 +298,51 @@ impl Editor {
         }
     }
 
-    /// Processes a single key event against the current editor state.
-    pub fn handle_key_event(&mut self, key: KeyEvent, viewport_rows: usize) {
-        if let PromptState::SaveAs { mut input } = self.prompt.clone() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.prompt = PromptState::None;
-                    self.status_message = Some("Save aborted.".to_string());
-                }
-                KeyCode::Enter => {
-                    let trimmed = input.trim().to_string();
-                    self.prompt = PromptState::None;
-                    if trimmed.is_empty() {
-                        self.status_message = Some("Save aborted: empty file name.".to_string());
-                    } else {
-                        match self.buffer.save_as(&trimmed) {
-                            Ok(bytes) => {
-                                self.status_message =
-                                    Some(format!("Wrote {bytes} bytes to {trimmed}"));
-                            }
-                            Err(err) => {
-                                self.status_message = Some(format!("Save error: {err}"));
-                            }
-                        }
-                    }
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                    self.prompt = PromptState::SaveAs { input };
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    input.push(c);
-                    self.prompt = PromptState::SaveAs { input };
-                }
-                _ => {}
-            }
-            return;
+    /// Reverts the most recent buffer edit and restores its cursor coordinates.
+    pub fn trigger_undo(&mut self) {
+        if let Some((cx, cy)) = self.buffer.undo(self.cx, self.cy) {
+            self.cx = cx;
+            self.cy = cy;
+            self.desired_cx = cx;
+            self.status_message = Some("Undo.".to_string());
+        } else {
+            self.status_message = Some("Already at oldest change.".to_string());
         }
+    }
 
-        if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL {
-            self.trigger_quit();
-            return;
+    /// Reapplies the most recently undone buffer edit and restores its cursor coordinates.
+    pub fn trigger_redo(&mut self) {
+        if let Some((cx, cy)) = self.buffer.redo(self.cx, self.cy) {
+            self.cx = cx;
+            self.cy = cy;
+            self.desired_cx = cx;
+            self.status_message = Some("Redo.".to_string());
+        } else {
+            self.status_message = Some("Already at newest change.".to_string());
         }
+    }
 
-        self.quit_confirm_pending = false;
+    /// Opens the interactive status-bar search prompt.
+    pub fn trigger_find(&mut self) {
+        self.prompt = PromptState::Search {
+            query: String::new(),
+            saved_cx: self.cx,
+            saved_cy: self.cy,
+        };
+        self.status_message = None;
+    }
+
+    /// Translates a `KeyEvent` into a unified `EditorCommand`, checking `Config` action bindings first.
+    pub fn resolve_command(&self, key: KeyEvent) -> EditorCommand {
+        if let Some(action) = self.config.action_for_key(key) {
+            return EditorCommand::Action(action);
+        }
 
         match (key.code, key.modifiers) {
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.trigger_save(),
-            (KeyCode::Enter, _) => self.insert_newline(),
-            (KeyCode::Backspace, _) => self.backspace(),
-            (KeyCode::Delete, _) => self.delete_forward(),
-            (KeyCode::Tab, _) => {
-                for _ in 0..TAB_STOP {
-                    self.insert_char(' ');
-                }
-            }
+            (KeyCode::Enter, _) => EditorCommand::InsertNewline,
+            (KeyCode::Backspace, _) => EditorCommand::Backspace,
+            (KeyCode::Delete, _) => EditorCommand::Delete,
+            (KeyCode::Tab, _) => EditorCommand::InsertTab,
             (
                 KeyCode::Up
                 | KeyCode::Down
@@ -335,14 +353,173 @@ impl Editor {
                 | KeyCode::PageUp
                 | KeyCode::PageDown,
                 _,
-            ) => self.move_cursor(key.code, viewport_rows),
+            ) => EditorCommand::Move(key.code),
             (KeyCode::Char(c), modifiers)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.insert_char(c);
+                EditorCommand::InsertChar(c)
             }
-            _ => {}
+            _ => EditorCommand::Noop,
         }
+    }
+
+    /// Processes a single key event against the current editor state.
+    pub fn handle_key_event(&mut self, key: KeyEvent, viewport_rows: usize) {
+        match self.prompt.clone() {
+            PromptState::SaveAs { mut input } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.prompt = PromptState::None;
+                        self.status_message = Some("Save aborted.".to_string());
+                    }
+                    KeyCode::Enter => {
+                        let trimmed = input.trim().to_string();
+                        self.prompt = PromptState::None;
+                        if trimmed.is_empty() {
+                            self.status_message =
+                                Some("Save aborted: empty file name.".to_string());
+                        } else {
+                            match self.buffer.save_as(&trimmed) {
+                                Ok(bytes) => {
+                                    self.status_message =
+                                        Some(format!("Wrote {bytes} bytes to {trimmed}"));
+                                }
+                                Err(err) => {
+                                    self.status_message = Some(format!("Save error: {err}"));
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                        self.prompt = PromptState::SaveAs { input };
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        input.push(c);
+                        self.prompt = PromptState::SaveAs { input };
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            PromptState::Search {
+                mut query,
+                saved_cx,
+                saved_cy,
+            } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.cx = saved_cx;
+                        self.cy = saved_cy;
+                        self.desired_cx = saved_cx;
+                        self.prompt = PromptState::None;
+                        self.status_message = Some("Search canceled.".to_string());
+                    }
+                    KeyCode::Enter | KeyCode::Down | KeyCode::Right => {
+                        if let Some((match_cx, match_cy)) =
+                            self.buffer.find(&query, self.cx + 1, self.cy, true)
+                        {
+                            self.cx = match_cx;
+                            self.cy = match_cy;
+                            self.desired_cx = match_cx;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Left => {
+                        if let Some((match_cx, match_cy)) =
+                            self.buffer.find(&query, self.cx, self.cy, false)
+                        {
+                            self.cx = match_cx;
+                            self.cy = match_cy;
+                            self.desired_cx = match_cx;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        if let Some((match_cx, match_cy)) =
+                            self.buffer.find(&query, saved_cx, saved_cy, true)
+                        {
+                            self.cx = match_cx;
+                            self.cy = match_cy;
+                            self.desired_cx = match_cx;
+                        } else {
+                            self.cx = saved_cx;
+                            self.cy = saved_cy;
+                            self.desired_cx = saved_cx;
+                        }
+                        self.prompt = PromptState::Search {
+                            query,
+                            saved_cx,
+                            saved_cy,
+                        };
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        query.push(c);
+                        if let Some((match_cx, match_cy)) =
+                            self.buffer.find(&query, saved_cx, saved_cy, true)
+                        {
+                            self.cx = match_cx;
+                            self.cy = match_cy;
+                            self.desired_cx = match_cx;
+                        }
+                        self.prompt = PromptState::Search {
+                            query,
+                            saved_cx,
+                            saved_cy,
+                        };
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            PromptState::None => {}
+        }
+
+        let command = self.resolve_command(key);
+
+        if command == EditorCommand::Action(Action::Quit) {
+            self.trigger_quit();
+            return;
+        }
+
+        self.quit_confirm_pending = false;
+
+        match command {
+            EditorCommand::Action(Action::Quit) => self.trigger_quit(),
+            EditorCommand::Action(Action::Save) => self.trigger_save(),
+            EditorCommand::Action(Action::Undo) => self.trigger_undo(),
+            EditorCommand::Action(Action::Redo) => self.trigger_redo(),
+            EditorCommand::Action(Action::Find) => self.trigger_find(),
+            EditorCommand::Move(code) => self.move_cursor(code, viewport_rows),
+            EditorCommand::InsertChar(c) => self.insert_char(c),
+            EditorCommand::InsertNewline => self.insert_newline(),
+            EditorCommand::Backspace => self.backspace(),
+            EditorCommand::Delete => self.delete_forward(),
+            EditorCommand::InsertTab => {
+                for _ in 0..TAB_STOP {
+                    self.insert_char(' ');
+                }
+            }
+            EditorCommand::Noop => {}
+        }
+    }
+
+    /// Queues configured background and foreground theme colors onto `stdout`.
+    fn apply_editor_theme(&self, stdout: &mut std::io::Stdout) -> Result<()> {
+        if let Some((r, g, b)) = self.config.theme.background {
+            queue!(stdout, SetBackgroundColor(Color::Rgb { r, g, b }))?;
+        }
+        if let Some((r, g, b)) = self.config.theme.foreground {
+            queue!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
+        }
+        Ok(())
     }
 
     /// Flushes all visual updates to the terminal in a single batch.
@@ -371,6 +548,8 @@ impl Editor {
 
         for row in 0..text_rows {
             let file_row = self.row_offset + row;
+            self.apply_editor_theme(stdout)?;
+
             if let Some(buffer_row) = self.buffer.get_row(file_row) {
                 let gutter = self.format_gutter_line(file_row);
                 let render_text = buffer_row.slice_chars(self.col_offset, text_cols);
@@ -378,9 +557,10 @@ impl Editor {
                     stdout,
                     SetAttribute(Attribute::Dim),
                     Print(gutter),
-                    SetAttribute(Attribute::Reset),
-                    Print(render_text)
+                    SetAttribute(Attribute::Reset)
                 )?;
+                self.apply_editor_theme(stdout)?;
+                queue!(stdout, Print(render_text))?;
             } else if self.buffer.is_empty() && file_row == 0 {
                 let gutter = self.format_gutter_line(0);
                 queue!(
@@ -389,6 +569,7 @@ impl Editor {
                     Print(gutter),
                     SetAttribute(Attribute::Reset)
                 )?;
+                self.apply_editor_theme(stdout)?;
             } else {
                 let tilde_gutter = format!(" {:>width$} ", "~", width = gutter_w.saturating_sub(2));
                 queue!(
@@ -397,21 +578,37 @@ impl Editor {
                     Print(tilde_gutter),
                     SetAttribute(Attribute::Reset)
                 )?;
+                self.apply_editor_theme(stdout)?;
             }
 
             queue!(stdout, Clear(ClearType::UntilNewLine), Print("\r\n"))?;
         }
+        queue!(stdout, ResetColor)?;
         Ok(())
     }
 
-    /// Draws the inverted status bar on the bottom terminal row.
+    /// Draws the inverted or custom-themed status bar on the bottom terminal row.
     fn draw_status_bar(&self, stdout: &mut std::io::Stdout, cols: u16) -> Result<()> {
         let status = self.format_status_bar(cols as usize);
+        let has_custom_status_theme =
+            self.config.theme.status_bg.is_some() || self.config.theme.status_fg.is_some();
+
+        if has_custom_status_theme {
+            if let Some((r, g, b)) = self.config.theme.status_bg {
+                queue!(stdout, SetBackgroundColor(Color::Rgb { r, g, b }))?;
+            }
+            if let Some((r, g, b)) = self.config.theme.status_fg {
+                queue!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
+            }
+        } else {
+            queue!(stdout, SetAttribute(Attribute::Reverse))?;
+        }
+
         queue!(
             stdout,
-            SetAttribute(Attribute::Reverse),
             Print(status),
             Clear(ClearType::UntilNewLine),
+            ResetColor,
             SetAttribute(Attribute::Reset)
         )?;
         Ok(())
@@ -525,10 +722,7 @@ mod tests {
         editor.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), 24);
         assert!(editor.buffer.dirty);
 
-        editor.handle_key_event(
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            24,
-        );
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL), 24);
         assert!(!editor.should_quit);
         assert!(editor.quit_confirm_pending);
 
@@ -536,16 +730,10 @@ mod tests {
         editor.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 24);
         assert!(!editor.quit_confirm_pending);
 
-        editor.handle_key_event(
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            24,
-        );
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL), 24);
         assert!(!editor.should_quit);
 
-        editor.handle_key_event(
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            24,
-        );
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL), 24);
         assert!(editor.should_quit);
     }
 
@@ -562,10 +750,7 @@ mod tests {
         assert_eq!((editor.cx, editor.cy), (1, 1));
 
         // Pressing Ctrl+S on an unnamed buffer opens the SaveAs prompt
-        editor.handle_key_event(
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            24,
-        );
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), 24);
         assert_eq!(
             editor.prompt,
             PromptState::SaveAs {
@@ -618,5 +803,54 @@ mod tests {
         assert_eq!(bar.chars().count(), 50);
         assert!(bar.starts_with(" notes.txt [+]"));
         assert!(bar.ends_with("Ln 2, Col 4 | 2 lines "));
+    }
+
+    #[test]
+    fn undo_and_redo_actions_work_via_key_events() {
+        let mut editor = Editor::new(Buffer::from_lines(&["hello"]));
+        editor.move_cursor(KeyCode::End, 24);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE), 24);
+        assert_eq!(editor.buffer.contents(), "hello!");
+        assert_eq!(editor.cx, 6);
+
+        // Ctrl+Z -> Undo
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.buffer.contents(), "hello");
+        assert_eq!(editor.cx, 5);
+
+        // Ctrl+Y -> Redo
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.buffer.contents(), "hello!");
+        assert_eq!(editor.cx, 6);
+    }
+
+    #[test]
+    fn find_prompt_jumps_between_matches_and_esc_restores_cursor() {
+        let mut editor = Editor::new(Buffer::from_lines(&[
+            "first target here",
+            "second target there",
+        ]));
+        editor.cx = 2;
+        editor.cy = 0;
+
+        // Open search with Ctrl+F
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 24);
+        for ch in "target".chars() {
+            editor.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), 24);
+        }
+        assert_eq!((editor.cx, editor.cy), (6, 0));
+
+        // Advance to next match with Down
+        editor.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 24);
+        assert_eq!((editor.cx, editor.cy), (7, 1));
+
+        // Move back to previous match with Up
+        editor.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 24);
+        assert_eq!((editor.cx, editor.cy), (6, 0));
+
+        // Esc cancels and restores original (2, 0) cursor position
+        editor.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 24);
+        assert_eq!(editor.prompt, PromptState::None);
+        assert_eq!((editor.cx, editor.cy), (2, 0));
     }
 }

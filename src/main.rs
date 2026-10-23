@@ -1,14 +1,17 @@
 mod buffer;
+mod config;
 mod editor;
 mod terminal;
 
 use anyhow::Result;
 use buffer::Buffer;
+use config::Config;
 use editor::Editor;
 use std::env;
 use terminal::Terminal;
 
 fn main() -> Result<()> {
+    let config = Config::load();
     let args: Vec<String> = env::args().collect();
 
     let buffer = if args.len() > 1 {
@@ -19,7 +22,7 @@ fn main() -> Result<()> {
 
     let _term = Terminal::initialize()?;
 
-    let mut editor = Editor::new(buffer);
+    let mut editor = Editor::with_config(buffer, config);
     editor.run()?;
 
     Ok(())
