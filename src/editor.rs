@@ -14,8 +14,6 @@ use crate::buffer::Buffer;
 use crate::config::{Action, Config};
 use crate::terminal::Terminal;
 
-const TAB_STOP: usize = 4;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptState {
     None,
@@ -47,6 +45,7 @@ pub struct Editor {
     pub config: Config,
     cx: usize,
     cy: usize,
+    rx: usize,
     desired_cx: usize,
     row_offset: usize,
     col_offset: usize,
@@ -61,13 +60,15 @@ impl Editor {
         Self::with_config(buffer, Config::default())
     }
 
-    pub fn with_config(buffer: Buffer, config: Config) -> Self {
+    pub fn with_config(mut buffer: Buffer, config: Config) -> Self {
+        buffer.set_tab_width(config.tab_width);
         Self {
             should_quit: false,
             buffer,
             config,
             cx: 0,
             cy: 0,
+            rx: 0,
             desired_cx: 0,
             row_offset: 0,
             col_offset: 0,
@@ -96,6 +97,14 @@ impl Editor {
         self.buffer.get_row(self.cy).map_or(0, |row| row.len)
     }
 
+    /// Computes the visual render column `rx` corresponding to `(self.cx, self.cy)`
+    /// after expanding `\t` characters to configured tab stops.
+    pub fn visual_cx(&self) -> usize {
+        self.buffer
+            .get_row(self.cy)
+            .map_or(self.cx, |row| row.cx_to_rx(self.cx))
+    }
+
     /// Computes the dynamic width of the line-number gutter (`digits + 2`).
     pub fn gutter_width(&self) -> usize {
         self.buffer.len().max(1).to_string().len() + 2
@@ -115,9 +124,10 @@ impl Editor {
         (text_cols, text_rows)
     }
 
-    /// Computes the hardware cursor screen coordinates `(screen_cx, screen_cy)`.
+    /// Computes the hardware cursor screen coordinates `(screen_cx, screen_cy)` using visual tab-expanded `rx`.
     pub fn cursor_screen_position(&self) -> (u16, u16) {
-        let screen_cx = (self.gutter_width() + self.cx.saturating_sub(self.col_offset)) as u16;
+        let rx = self.visual_cx();
+        let screen_cx = (self.gutter_width() + rx.saturating_sub(self.col_offset)) as u16;
         let screen_cy = self.cy.saturating_sub(self.row_offset) as u16;
         (screen_cx, screen_cy)
     }
@@ -168,6 +178,8 @@ impl Editor {
 
     /// Adjusts vertical and horizontal viewport offsets so the cursor stays visible.
     pub fn scroll(&mut self, screen_cols: usize, screen_rows: usize) {
+        self.rx = self.visual_cx();
+
         if self.cy < self.row_offset {
             self.row_offset = self.cy;
         }
@@ -175,11 +187,11 @@ impl Editor {
             self.row_offset = self.cy - screen_rows + 1;
         }
 
-        if self.cx < self.col_offset {
-            self.col_offset = self.cx;
+        if self.rx < self.col_offset {
+            self.col_offset = self.rx;
         }
-        if screen_cols > 0 && self.cx >= self.col_offset + screen_cols {
-            self.col_offset = self.cx - screen_cols + 1;
+        if screen_cols > 0 && self.rx >= self.col_offset + screen_cols {
+            self.col_offset = self.rx - screen_cols + 1;
         }
     }
 
@@ -502,11 +514,7 @@ impl Editor {
             EditorCommand::InsertNewline => self.insert_newline(),
             EditorCommand::Backspace => self.backspace(),
             EditorCommand::Delete => self.delete_forward(),
-            EditorCommand::InsertTab => {
-                for _ in 0..TAB_STOP {
-                    self.insert_char(' ');
-                }
-            }
+            EditorCommand::InsertTab => self.insert_char('\t'),
             EditorCommand::Noop => {}
         }
     }
@@ -852,5 +860,20 @@ mod tests {
         editor.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 24);
         assert_eq!(editor.prompt, PromptState::None);
         assert_eq!((editor.cx, editor.cy), (2, 0));
+    }
+
+    #[test]
+    fn tab_insertion_and_visual_cursor_align_with_expanded_tab_stops() {
+        let mut editor = Editor::new(Buffer::new());
+        editor.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 24);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), 24);
+
+        // Logical buffer stores raw '\t' + 'x' (2 chars), while render expands '\t' to 4 spaces (5 visual cols)
+        assert_eq!(editor.buffer.contents(), "\tx");
+        assert_eq!(editor.buffer.get_row(0).unwrap().render, "    x");
+        assert_eq!(editor.cx, 2);
+        assert_eq!(editor.visual_cx(), 5);
+        // Gutter width for 1 line is 3 (" 1 "), so screen_cx is 3 + 5 = 8
+        assert_eq!(editor.cursor_screen_position(), (8, 0));
     }
 }
