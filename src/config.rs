@@ -5,9 +5,28 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+pub const DEFAULT_TAB_WIDTH: usize = 4;
+
+fn default_tab_width() -> usize {
+    DEFAULT_TAB_WIDTH
+}
+
+fn deserialize_tab_width<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = usize::deserialize(deserializer)?;
+    Ok(if raw == 0 { DEFAULT_TAB_WIDTH } else { raw })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(
+        default = "default_tab_width",
+        deserialize_with = "deserialize_tab_width"
+    )]
+    pub tab_width: usize,
     pub theme: ThemeConfig,
     #[serde(deserialize_with = "deserialize_keys")]
     pub keys: HashMap<String, Action>,
@@ -57,6 +76,7 @@ where
 impl Default for Config {
     fn default() -> Self {
         Self {
+            tab_width: DEFAULT_TAB_WIDTH,
             theme: ThemeConfig::default(),
             keys: default_keys(),
         }
