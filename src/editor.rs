@@ -56,6 +56,9 @@ pub enum PromptState {
         saved_cy: usize,
         case_sensitive: bool,
     },
+    GotoLine {
+        input: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,14 +171,22 @@ impl Editor {
     }
 
     /// Computes the active hardware cursor screen coordinates, placing the cursor on the bottom
-    /// status bar when typing in the `SaveAs` prompt and clamping to terminal bounds.
+    /// status bar when typing in the `SaveAs` or `GotoLine` prompt and clamping to terminal bounds.
     pub fn active_cursor_screen_position(&self, cols: u16, rows: u16) -> (u16, u16) {
         let max_col = cols.saturating_sub(1);
         let max_row = rows.saturating_sub(1);
-        if let PromptState::SaveAs { input } = &self.prompt {
-            let prompt_prefix = format!(" Save as: {input}");
-            let width = str_display_width(&prompt_prefix).min(u16::MAX as usize) as u16;
-            return (width.min(max_col), max_row);
+        match &self.prompt {
+            PromptState::SaveAs { input } => {
+                let prompt_prefix = format!(" Save as: {input}");
+                let width = str_display_width(&prompt_prefix).min(u16::MAX as usize) as u16;
+                return (width.min(max_col), max_row);
+            }
+            PromptState::GotoLine { input } => {
+                let prompt_prefix = format!(" Go to line: {input}");
+                let width = str_display_width(&prompt_prefix).min(u16::MAX as usize) as u16;
+                return (width.min(max_col), max_row);
+            }
+            _ => {}
         }
         let (screen_cx, screen_cy) = self.cursor_screen_position();
         let max_text_row = rows.saturating_sub(2);
@@ -198,6 +209,7 @@ impl Editor {
                 let mode = if *case_sensitive { "Aa" } else { "aa" };
                 format!(" Search [{mode}] (Alt+C case, arrows/Enter): {query}")
             }
+            PromptState::GotoLine { input } => format!(" Go to line: {input}"),
             PromptState::None => {
                 let name = self.buffer.filename.as_deref().unwrap_or("[No Name]");
                 let dirty = if self.buffer.dirty { " [+]" } else { "" };
@@ -302,8 +314,16 @@ impl Editor {
                 }
             }
             KeyCode::Home => {
-                self.cx = 0;
-                self.desired_cx = 0;
+                let first_non_ws = self
+                    .buffer
+                    .get_row(self.cy)
+                    .map_or(0, |row| row.first_non_whitespace_cx());
+                if self.cx == first_non_ws {
+                    self.cx = 0;
+                } else {
+                    self.cx = first_non_ws;
+                }
+                self.desired_cx = self.visual_cx();
             }
             KeyCode::End => {
                 self.cx = self.current_row_len();
@@ -336,12 +356,15 @@ impl Editor {
         self.desired_cx = self.visual_cx();
     }
 
-    /// Splits the current line at the cursor and moves to the start of the new line.
+    /// Splits the current line at the cursor (preserving indentation when `auto_indent` is enabled)
+    /// and moves to the new line.
     pub fn insert_newline(&mut self) {
-        self.buffer.insert_newline(self.cx, self.cy);
-        self.cy += 1;
-        self.cx = 0;
-        self.desired_cx = 0;
+        let (new_cx, new_cy) =
+            self.buffer
+                .insert_newline_with_indent(self.cx, self.cy, self.config.auto_indent);
+        self.cx = new_cx;
+        self.cy = new_cy;
+        self.desired_cx = self.visual_cx();
     }
 
     /// Deletes the character to the left of the cursor or joins with the previous line.
@@ -412,6 +435,93 @@ impl Editor {
         } else {
             self.status_message = Some("Already at newest change.".to_string());
         }
+    }
+
+    /// Duplicates the current line directly below and moves the cursor to the duplicated line.
+    pub fn trigger_duplicate_line(&mut self) {
+        if let Some((new_cx, new_cy)) = self.buffer.duplicate_line(self.cx, self.cy) {
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
+        }
+    }
+
+    /// Deletes the current line and clamps the cursor to the remaining buffer rows.
+    pub fn trigger_delete_line(&mut self) {
+        if let Some((_, new_cy)) = self.buffer.delete_line(self.cx, self.cy) {
+            self.cy = new_cy;
+            self.cx = self
+                .buffer
+                .get_row(self.cy)
+                .map_or(0, |row| row.rx_to_cx(self.desired_cx));
+        }
+    }
+
+    /// Inserts a new line below the current row at the same indentation level without splitting
+    /// the current line, and moves the cursor to the end of the new line's indentation.
+    pub fn trigger_insert_line_below(&mut self) {
+        let (new_cx, new_cy) = self.buffer.insert_line_below(self.cx, self.cy);
+        self.cx = new_cx;
+        self.cy = new_cy;
+        self.desired_cx = self.visual_cx();
+    }
+
+    /// Inserts a new line above the current row at the same indentation level without splitting
+    /// the current line, and moves the cursor to the end of the new line's indentation.
+    pub fn trigger_insert_line_above(&mut self) {
+        let (new_cx, new_cy) = self.buffer.insert_line_above(self.cx, self.cy);
+        self.cx = new_cx;
+        self.cy = new_cy;
+        self.desired_cx = self.visual_cx();
+    }
+
+    /// Removes one tab stop of leading indentation from the current line.
+    pub fn trigger_unindent(&mut self) {
+        if let Some(new_cx) = self.buffer.unindent_line(self.cx, self.cy) {
+            self.cx = new_cx;
+            self.desired_cx = self.visual_cx();
+        }
+    }
+
+    /// Moves the cursor to the previous word boundary.
+    pub fn trigger_word_left(&mut self) {
+        self.buffer.break_undo_coalesce();
+        let (new_cx, new_cy) = self.buffer.word_boundary_left(self.cx, self.cy);
+        self.cx = new_cx;
+        self.cy = new_cy;
+        self.desired_cx = self.visual_cx();
+    }
+
+    /// Moves the cursor to the next word boundary.
+    pub fn trigger_word_right(&mut self) {
+        self.buffer.break_undo_coalesce();
+        let (new_cx, new_cy) = self.buffer.word_boundary_right(self.cx, self.cy);
+        self.cx = new_cx;
+        self.cy = new_cy;
+        self.desired_cx = self.visual_cx();
+    }
+
+    /// Deletes the word to the left of the cursor.
+    pub fn trigger_delete_word_left(&mut self) {
+        if let Some((new_cx, new_cy)) = self.buffer.delete_word_left(self.cx, self.cy) {
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
+        }
+    }
+
+    /// Deletes the word to the right of the cursor.
+    pub fn trigger_delete_word_right(&mut self) {
+        self.buffer.delete_word_right(self.cx, self.cy);
+        self.desired_cx = self.visual_cx();
+    }
+
+    /// Opens the interactive status-bar Go-To-Line prompt.
+    pub fn trigger_goto_line(&mut self) {
+        self.prompt = PromptState::GotoLine {
+            input: String::new(),
+        };
+        self.status_message = None;
     }
 
     /// Opens the interactive status-bar search prompt (case-insensitive by default).
@@ -628,6 +738,51 @@ impl Editor {
                 }
                 return;
             }
+            PromptState::GotoLine { mut input } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.prompt = PromptState::None;
+                        self.status_message = Some("Go to line canceled.".to_string());
+                    }
+                    KeyCode::Enter => {
+                        let trimmed = input.trim();
+                        self.prompt = PromptState::None;
+                        if let Ok(line_num) = trimmed.parse::<usize>()
+                            && line_num > 0
+                        {
+                            if self.buffer.is_empty() {
+                                self.cy = 0;
+                                self.cx = 0;
+                                self.desired_cx = 0;
+                            } else {
+                                self.cy = (line_num - 1).min(self.buffer.len() - 1);
+                                self.cx = self
+                                    .buffer
+                                    .get_row(self.cy)
+                                    .map_or(0, |row| row.rx_to_cx(self.desired_cx));
+                            }
+                            self.status_message = None;
+                        } else {
+                            self.status_message = Some("Invalid line number.".to_string());
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                        self.prompt = PromptState::GotoLine { input };
+                    }
+                    KeyCode::Char(c)
+                        if c.is_ascii_digit()
+                            && !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        input.push(c);
+                        self.prompt = PromptState::GotoLine { input };
+                    }
+                    _ => {}
+                }
+                return;
+            }
             PromptState::None => {}
         }
 
@@ -646,6 +801,16 @@ impl Editor {
             EditorCommand::Action(Action::Undo) => self.trigger_undo(),
             EditorCommand::Action(Action::Redo) => self.trigger_redo(),
             EditorCommand::Action(Action::Find) => self.trigger_find(),
+            EditorCommand::Action(Action::DuplicateLine) => self.trigger_duplicate_line(),
+            EditorCommand::Action(Action::DeleteLine) => self.trigger_delete_line(),
+            EditorCommand::Action(Action::InsertLineBelow) => self.trigger_insert_line_below(),
+            EditorCommand::Action(Action::InsertLineAbove) => self.trigger_insert_line_above(),
+            EditorCommand::Action(Action::Unindent) => self.trigger_unindent(),
+            EditorCommand::Action(Action::WordLeft) => self.trigger_word_left(),
+            EditorCommand::Action(Action::WordRight) => self.trigger_word_right(),
+            EditorCommand::Action(Action::DeleteWordLeft) => self.trigger_delete_word_left(),
+            EditorCommand::Action(Action::DeleteWordRight) => self.trigger_delete_word_right(),
+            EditorCommand::Action(Action::GotoLine) => self.trigger_goto_line(),
             EditorCommand::Move(code) => self.move_cursor(code, viewport_rows),
             EditorCommand::InsertChar(c) => self.insert_char(c),
             EditorCommand::InsertNewline => self.insert_newline(),
@@ -1113,5 +1278,108 @@ mod tests {
         // Pressing Alt+C again returns to case-insensitive mode, matching line 0 at cx = 6
         editor.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT), 24);
         assert_eq!((editor.cx, editor.cy), (6, 0));
+    }
+
+    #[test]
+    fn ctrl_d_duplicates_line_and_ctrl_shift_d_deletes_line() {
+        let mut editor = Editor::new(Buffer::from_lines(&["line one", "line two", "line three"]));
+        editor.move_cursor(KeyCode::Down, 24);
+        editor.move_cursor(KeyCode::End, 24);
+        assert_eq!((editor.cx, editor.cy), (8, 1));
+
+        // Ctrl+D duplicates "line two" onto row 2 and moves cursor to row 2
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), 24);
+        assert_eq!(
+            editor.buffer.contents(),
+            "line one\nline two\nline two\nline three"
+        );
+        assert_eq!((editor.cx, editor.cy), (8, 2));
+
+        // Ctrl+Shift+D deletes the duplicated "line two"
+        editor.handle_key_event(
+            KeyEvent::new(
+                KeyCode::Char('D'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            24,
+        );
+        assert_eq!(editor.buffer.contents(), "line one\nline two\nline three");
+        assert_eq!((editor.cx, editor.cy), (8, 2));
+
+        // Ctrl+Z restores the deleted line
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL), 24);
+        assert_eq!(
+            editor.buffer.contents(),
+            "line one\nline two\nline two\nline three"
+        );
+        assert_eq!((editor.cx, editor.cy), (8, 2));
+    }
+
+    #[test]
+    fn shift_enter_and_ctrl_shift_enter_insert_indented_lines_below_and_above() {
+        let mut editor = Editor::new(Buffer::from_lines(&["    fn main() {", "    }"]));
+        // Place cursor in the middle of line 0 ("    fn| main() {")
+        editor.cx = 6;
+        editor.cy = 0;
+
+        editor.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), 24);
+        assert_eq!(editor.buffer.len(), 3);
+        assert_eq!(editor.buffer.get_row(0).unwrap().text(), "    fn main() {");
+        assert_eq!(editor.buffer.get_row(1).unwrap().text(), "    ");
+        assert_eq!(editor.buffer.get_row(2).unwrap().text(), "    }");
+        assert_eq!((editor.cx, editor.cy), (4, 1));
+
+        // Move to closing brace line ("    }") and insert line above with Ctrl+Shift+Enter
+        editor.cy = 2;
+        editor.cx = 5;
+        editor.handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            24,
+        );
+        assert_eq!(editor.buffer.len(), 4);
+        assert_eq!(editor.buffer.get_row(2).unwrap().text(), "    ");
+        assert_eq!(editor.buffer.get_row(3).unwrap().text(), "    }");
+        assert_eq!((editor.cx, editor.cy), (4, 2));
+    }
+
+    #[test]
+    fn auto_indent_unindent_smart_home_word_ops_and_goto_line_work() {
+        let mut editor = Editor::new(Buffer::from_lines(&[
+            "    let alpha_beta = 42;",
+            "second line",
+            "third line",
+        ]));
+        editor.cx = 10;
+        editor.cy = 0;
+
+        // Smart Home: first press jumps to first non-whitespace char (cx = 4), second press jumps to 0
+        editor.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), 24);
+        assert_eq!(editor.cx, 4);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), 24);
+        assert_eq!(editor.cx, 0);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), 24);
+        assert_eq!(editor.cx, 4);
+
+        // Word Right jumps past "let" to cx = 7, then past " alpha_beta" to cx = 18
+        editor.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.cx, 7);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.cx, 18);
+
+        // Delete Word Left deletes "alpha_beta" back to cx = 8
+        editor.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.cx, 8);
+        assert_eq!(editor.buffer.get_row(0).unwrap().text(), "    let  = 42;");
+
+        // Shift+Tab (BackTab) unindents line 0 by 4 spaces
+        editor.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), 24);
+        assert_eq!(editor.buffer.get_row(0).unwrap().text(), "let  = 42;");
+        assert_eq!(editor.cx, 4);
+
+        // Ctrl+G opens GotoLine prompt; typing "3" + Enter jumps to line 3 (cy = 2)
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL), 24);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE), 24);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 24);
+        assert_eq!(editor.cy, 2);
     }
 }

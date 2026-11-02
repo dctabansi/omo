@@ -9,8 +9,8 @@ Unlike modal editors that split input across normal, insert, and visual states, 
 - **Strictly Amodal:** Start typing immediately — no mode switching required.
 - **Fast & Lightweight:** Hand-rolled batched ANSI rendering over `crossterm` with zero TUI framework overhead and zero screen flicker.
 - **Line-Level Gap Buffer:** $O(1)$ amortized character insertions and deletions with full multi-byte UTF-8 safety and visual tab-stop expansion.
-- **Essential Editing Controls:** Built-in undo/redo history, incremental forward/backward search, unnamed buffer save prompts, and dirty-buffer quit protection.
-- **Declarative Configuration:** Optional `~/.config/omo/config.toml` for custom keybindings, tab width, and 24-bit RGB theme colors, with zero-config defaults out of the box.
+- **Essential Editing Controls:** Built-in undo/redo history, word navigation & deletion, line duplication/deletion, smart auto-indentation, go-to-line, case-insensitive/case-sensitive incremental search, unnamed buffer save prompts, and dirty-buffer quit protection.
+- **Declarative Configuration:** Optional `~/.config/omo/config.toml` (or `$XDG_CONFIG_HOME/omo/config.toml` / `$OMO_CONFIG`) for custom keybindings, tab width, auto-indent, and 24-bit RGB theme colors, with zero-config defaults out of the box.
 - **Crash-Safe Terminal State:** RAII terminal guard restores raw mode, alternate screen, cursor visibility, and colors cleanly on exit or panic.
 
 ## Installation
@@ -43,6 +43,13 @@ Start with an empty buffer:
 omo
 ```
 
+Check version or usage help:
+
+```bash
+omo -v          # or: omo -V / omo --version
+omo --help      # or: omo -h
+```
+
 ### Use as Default Git Editor
 
 ```bash
@@ -63,12 +70,21 @@ export VISUAL="omo"
 | Key | Action |
 | :--- | :--- |
 | `Up` / `Down` / `Left` / `Right` | Move cursor |
-| `Home` / `End` | Jump to start / end of line |
+| `Ctrl+Left` / `Ctrl+Right` (`Alt+Left` / `Alt+Right`) | Jump cursor by word |
+| `Home` / `End` | Smart jump to first non-whitespace / start / end of line |
 | `PageUp` / `PageDown` | Scroll viewport up / down by page |
+| `Enter` | Split line with smart auto-indentation |
+| `Shift+Tab` | Unindent current line by one tab stop |
+| `Ctrl+Backspace` / `Ctrl+Delete` (`Alt+Backspace` / `Alt+Delete` / `Ctrl+W`) | Delete previous / next word |
 | `Ctrl+S` / `Alt+S` / `F2` | Save file (prompts for filename if unnamed) |
 | `Ctrl+Q` / `Alt+Q` | Quit (press twice to discard unsaved changes) |
 | `Ctrl+Z` / `Alt+Z` | Undo |
 | `Ctrl+Y` / `Alt+Y` / `Ctrl+Shift+Z` | Redo |
+| `Ctrl+D` / `Alt+D` | Duplicate current line |
+| `Ctrl+Shift+D` / `Alt+Shift+D` | Delete current line |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+Enter` | Insert new line below at current indentation |
+| `Ctrl+Shift+Enter` / `Ctrl+Alt+Enter` / `Alt+Shift+Enter` | Insert new line above at current indentation |
+| `Ctrl+G` / `Alt+G` | Go to line number |
 | `Ctrl+F` / `Alt+F` / `F3` | Incremental search (`Enter` accept, `Up`/`Down` prev/next, `Alt+C` toggle case, `Esc` cancel) |
 
 ## Configuration
@@ -77,6 +93,7 @@ export VISUAL="omo"
 
 ```toml
 tab_width = 4
+auto_indent = true
 
 [theme]
 background = [30, 30, 46]
@@ -89,6 +106,16 @@ status_fg  = [180, 190, 254]
 "ctrl+s" = "save"
 "ctrl+z" = "undo"
 "ctrl+y" = "redo"
+"ctrl+d" = "duplicate_line"
+"ctrl+shift+d" = "delete_line"
+"shift+enter" = "insert_line_below"
+"ctrl+shift+enter" = "insert_line_above"
+"shift+tab" = "unindent"
+"ctrl+left" = "word_left"
+"ctrl+right" = "word_right"
+"ctrl+backspace" = "delete_word_left"
+"ctrl+delete" = "delete_word_right"
+"ctrl+g" = "goto_line"
 "ctrl+f" = "find"
 ```
 
@@ -98,6 +125,16 @@ status_fg  = [180, 190, 254]
 - `"save"` — Save the current buffer
 - `"undo"` — Undo the last edit
 - `"redo"` — Redo the last undone edit
+- `"duplicate_line"` — Duplicate the current line below
+- `"delete_line"` — Delete the entire current line
+- `"insert_line_below"` — Insert an indented new line below without splitting the current line
+- `"insert_line_above"` — Insert an indented new line above without splitting the current line
+- `"unindent"` — Remove one tab stop of leading indentation from the current line
+- `"word_left"` — Move the cursor to the previous word boundary
+- `"word_right"` — Move the cursor to the next word boundary
+- `"delete_word_left"` — Delete from the cursor to the previous word boundary
+- `"delete_word_right"` — Delete from the cursor to the next word boundary
+- `"goto_line"` — Open the interactive Go-to-Line prompt
 - `"find"` — Open the interactive search prompt
 
 ## License

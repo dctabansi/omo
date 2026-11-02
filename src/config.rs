@@ -19,6 +19,10 @@ where
     Ok(if raw == 0 { DEFAULT_TAB_WIDTH } else { raw })
 }
 
+fn default_auto_indent() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -27,6 +31,8 @@ pub struct Config {
         deserialize_with = "deserialize_tab_width"
     )]
     pub tab_width: usize,
+    #[serde(default = "default_auto_indent")]
+    pub auto_indent: bool,
     pub theme: ThemeConfig,
     #[serde(deserialize_with = "deserialize_keys")]
     pub keys: HashMap<String, Action>,
@@ -49,6 +55,16 @@ pub enum Action {
     Undo,
     Redo,
     Find,
+    DuplicateLine,
+    DeleteLine,
+    InsertLineBelow,
+    InsertLineAbove,
+    Unindent,
+    WordLeft,
+    WordRight,
+    DeleteWordLeft,
+    DeleteWordRight,
+    GotoLine,
 }
 
 pub fn default_keys() -> HashMap<String, Action> {
@@ -66,6 +82,30 @@ pub fn default_keys() -> HashMap<String, Action> {
     keys.insert("ctrl+f".to_string(), Action::Find);
     keys.insert("alt+f".to_string(), Action::Find);
     keys.insert("f3".to_string(), Action::Find);
+    keys.insert("ctrl+d".to_string(), Action::DuplicateLine);
+    keys.insert("alt+d".to_string(), Action::DuplicateLine);
+    keys.insert("ctrl+shift+d".to_string(), Action::DeleteLine);
+    keys.insert("alt+shift+d".to_string(), Action::DeleteLine);
+    keys.insert("shift+enter".to_string(), Action::InsertLineBelow);
+    keys.insert("ctrl+enter".to_string(), Action::InsertLineBelow);
+    keys.insert("alt+enter".to_string(), Action::InsertLineBelow);
+    keys.insert("ctrl+j".to_string(), Action::InsertLineBelow);
+    keys.insert("ctrl+shift+enter".to_string(), Action::InsertLineAbove);
+    keys.insert("ctrl+alt+enter".to_string(), Action::InsertLineAbove);
+    keys.insert("alt+shift+enter".to_string(), Action::InsertLineAbove);
+    keys.insert("shift+tab".to_string(), Action::Unindent);
+    keys.insert("ctrl+left".to_string(), Action::WordLeft);
+    keys.insert("alt+left".to_string(), Action::WordLeft);
+    keys.insert("ctrl+right".to_string(), Action::WordRight);
+    keys.insert("alt+right".to_string(), Action::WordRight);
+    keys.insert("ctrl+backspace".to_string(), Action::DeleteWordLeft);
+    keys.insert("alt+backspace".to_string(), Action::DeleteWordLeft);
+    keys.insert("ctrl+w".to_string(), Action::DeleteWordLeft);
+    keys.insert("ctrl+h".to_string(), Action::DeleteWordLeft);
+    keys.insert("ctrl+delete".to_string(), Action::DeleteWordRight);
+    keys.insert("alt+delete".to_string(), Action::DeleteWordRight);
+    keys.insert("ctrl+g".to_string(), Action::GotoLine);
+    keys.insert("alt+g".to_string(), Action::GotoLine);
     keys
 }
 
@@ -120,6 +160,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             tab_width: DEFAULT_TAB_WIDTH,
+            auto_indent: true,
             theme: ThemeConfig::default(),
             keys: default_keys(),
         }
@@ -244,8 +285,10 @@ pub fn format_key_event(key: KeyEvent) -> Option<String> {
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
     let is_standalone_bindable = matches!(key.code, KeyCode::F(_) | KeyCode::Esc);
+    let is_shifted_non_char =
+        key.modifiers.contains(KeyModifiers::SHIFT) && !matches!(key.code, KeyCode::Char(_));
 
-    if !has_ctrl_or_alt && !is_standalone_bindable {
+    if !has_ctrl_or_alt && !is_standalone_bindable && !is_shifted_non_char {
         return None;
     }
 
@@ -336,6 +379,52 @@ mod tests {
         assert_eq!(
             cfg.action_for_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
             Some(Action::Find)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(Action::DuplicateLine)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(
+                KeyCode::Char('D'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Some(Action::DeleteLine)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(Action::InsertLineBelow)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Some(Action::InsertLineAbove)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Action::Unindent)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)),
+            Some(Action::WordLeft)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)),
+            Some(Action::WordRight)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+            Some(Action::DeleteWordLeft)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL)),
+            Some(Action::DeleteWordRight)
+        );
+        assert_eq!(
+            cfg.action_for_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            Some(Action::GotoLine)
         );
     }
 

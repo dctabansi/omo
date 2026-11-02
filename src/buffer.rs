@@ -119,6 +119,23 @@ pub fn char_display_width(c: char) -> usize {
     1
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Whitespace,
+    Word,
+    Punctuation,
+}
+
+fn classify_char(c: char) -> CharClass {
+    if c.is_whitespace() {
+        CharClass::Whitespace
+    } else if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else {
+        CharClass::Punctuation
+    }
+}
+
 /// Returns the total terminal display column width of a string slice.
 pub fn str_display_width(s: &str) -> usize {
     s.chars()
@@ -446,6 +463,15 @@ impl Row {
         self.update_render();
     }
 
+    /// Returns the character index of the first non-whitespace character (`' '` or `'\t'`),
+    /// or `0` if the row is empty or consists solely of whitespace.
+    pub fn first_non_whitespace_cx(&self) -> usize {
+        self.buffer
+            .chars()
+            .position(|c| c != ' ' && c != '\t')
+            .unwrap_or(0)
+    }
+
     /// Returns a display-column-safe horizontal slice of the tab-expanded `render` string
     /// for viewport rendering within `max_cols` terminal columns.
     pub fn slice_chars(&self, col_offset: usize, max_cols: usize) -> String {
@@ -490,6 +516,7 @@ impl Row {
 
     /// Returns all character start indices (including overlapping occurrences) where `query`
     /// matches within this row (case-insensitive by default).
+    #[allow(dead_code)]
     pub fn find_matches(&self, query: &str) -> Vec<usize> {
         self.find_matches_with_case(query, false)
     }
@@ -705,6 +732,7 @@ impl Buffer {
 
     /// Searches for `query` (case-insensitive) starting from `(start_cx, start_cy)` in `forward`
     /// or backward order, wrapping around the buffer and returning `(match_cx, match_cy)`.
+    #[allow(dead_code)]
     pub fn find(
         &self,
         query: &str,
@@ -813,18 +841,259 @@ impl Buffer {
     }
 
     /// Splits the row at `(cx, cy)` or inserts a new empty line when the buffer is empty.
+    #[allow(dead_code)]
     pub fn insert_newline(&mut self, cx: usize, cy: usize) {
+        let _ = self.insert_newline_with_indent(cx, cy, false);
+    }
+
+    /// Splits the row at `(cx, cy)`, optionally copying the current line's leading indentation
+    /// (`' '` and `'\t'` up to `cx`) onto the new row, and returns the new `(cx, cy)` cursor position.
+    pub fn insert_newline_with_indent(
+        &mut self,
+        cx: usize,
+        cy: usize,
+        auto_indent: bool,
+    ) -> (usize, usize) {
         self.record_snapshot(cx, cy);
         if self.rows.is_empty() {
             self.rows.push(Row::with_tab_width("", self.tab_width));
             self.rows.push(Row::with_tab_width("", self.tab_width));
-        } else if cy >= self.rows.len() {
+            self.dirty = true;
+            return (0, 1);
+        }
+        if cy >= self.rows.len() {
             self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.dirty = true;
+            return (0, self.rows.len() - 1);
+        }
+
+        let indent: String = if auto_indent {
+            self.rows[cy]
+                .buffer
+                .chars()
+                .take(cx)
+                .take_while(|&c| c == ' ' || c == '\t')
+                .collect()
         } else {
-            let new_row = self.rows[cy].split(cx);
-            self.rows.insert(cy + 1, new_row);
+            String::new()
+        };
+        let indent_len = indent.chars().count();
+        let tail = self.rows[cy].split(cx);
+        let mut new_row = Row::with_tab_width(&indent, self.tab_width);
+        new_row.append(&tail);
+        self.rows.insert(cy + 1, new_row);
+        self.dirty = true;
+        (indent_len, cy + 1)
+    }
+
+    /// Inserts a new line below `cy` indented to match `cy`'s leading whitespace without
+    /// modifying or splitting row `cy`, returning the new `(cx, cy)` cursor coordinates.
+    pub fn insert_line_below(&mut self, cx: usize, cy: usize) -> (usize, usize) {
+        self.record_snapshot(cx, cy);
+        if self.rows.is_empty() {
+            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.dirty = true;
+            return (0, 1);
+        }
+
+        let target_cy = cy.min(self.rows.len() - 1);
+        let indent: String = self.rows[target_cy]
+            .buffer
+            .chars()
+            .take_while(|&c| c == ' ' || c == '\t')
+            .collect();
+        let new_cx = indent.chars().count();
+        let new_row = Row::with_tab_width(&indent, self.tab_width);
+        self.rows.insert(target_cy + 1, new_row);
+        self.dirty = true;
+        (new_cx, target_cy + 1)
+    }
+
+    /// Inserts a new line above `cy` indented to match `cy`'s leading whitespace without
+    /// modifying or splitting row `cy`, returning the new `(cx, cy)` cursor coordinates.
+    pub fn insert_line_above(&mut self, cx: usize, cy: usize) -> (usize, usize) {
+        self.record_snapshot(cx, cy);
+        if self.rows.is_empty() {
+            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.dirty = true;
+            return (0, 0);
+        }
+
+        let target_cy = cy.min(self.rows.len() - 1);
+        let indent: String = self.rows[target_cy]
+            .buffer
+            .chars()
+            .take_while(|&c| c == ' ' || c == '\t')
+            .collect();
+        let new_cx = indent.chars().count();
+        let new_row = Row::with_tab_width(&indent, self.tab_width);
+        self.rows.insert(target_cy, new_row);
+        self.dirty = true;
+        (new_cx, target_cy)
+    }
+
+    /// Duplicates the row at `cy` directly below it, returning `(cx, cy + 1)` if a row existed.
+    pub fn duplicate_line(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
+        if cy >= self.rows.len() {
+            return None;
+        }
+        self.record_snapshot(cx, cy);
+        let cloned = self.rows[cy].clone();
+        self.rows.insert(cy + 1, cloned);
+        self.dirty = true;
+        Some((cx.min(self.rows[cy + 1].len), cy + 1))
+    }
+
+    /// Removes one leading tab stop (`'\t'` or up to `self.tab_width` spaces) from row `cy`,
+    /// returning the updated `cx` if any indentation was removed.
+    pub fn unindent_line(&mut self, cx: usize, cy: usize) -> Option<usize> {
+        if cy >= self.rows.len() {
+            return None;
+        }
+        let first = self.rows[cy].buffer.chars().next()?;
+        let remove_count = if first == '\t' {
+            1
+        } else if first == ' ' {
+            let max_spaces = self.tab_width.max(1);
+            self.rows[cy]
+                .buffer
+                .chars()
+                .take(max_spaces)
+                .take_while(|&c| c == ' ')
+                .count()
+        } else {
+            0
+        };
+
+        if remove_count == 0 {
+            return None;
+        }
+
+        self.record_snapshot(cx, cy);
+        for _ in 0..remove_count {
+            self.rows[cy].delete_char(0);
+        }
+        if self.rows.len() == 1 && self.rows[0].len == 0 {
+            self.rows.clear();
         }
         self.dirty = true;
+        Some(cx.saturating_sub(remove_count))
+    }
+
+    /// Computes the `(cx, cy)` position of the previous word boundary to the left of `(cx, cy)`.
+    pub fn word_boundary_left(&self, cx: usize, cy: usize) -> (usize, usize) {
+        if self.rows.is_empty() {
+            return (0, 0);
+        }
+        let clamped_cy = cy.min(self.rows.len() - 1);
+        let chars: Vec<char> = self.rows[clamped_cy].buffer.chars().collect();
+        let mut idx = cx.min(chars.len());
+
+        if idx == 0 {
+            if clamped_cy > 0 {
+                return (self.rows[clamped_cy - 1].len, clamped_cy - 1);
+            }
+            return (0, 0);
+        }
+
+        while idx > 0 && classify_char(chars[idx - 1]) == CharClass::Whitespace {
+            idx -= 1;
+        }
+        if idx > 0 {
+            let target_class = classify_char(chars[idx - 1]);
+            while idx > 0 && classify_char(chars[idx - 1]) == target_class {
+                idx -= 1;
+            }
+        }
+        (idx, clamped_cy)
+    }
+
+    /// Computes the `(cx, cy)` position of the next word boundary to the right of `(cx, cy)`.
+    pub fn word_boundary_right(&self, cx: usize, cy: usize) -> (usize, usize) {
+        if self.rows.is_empty() {
+            return (0, 0);
+        }
+        let clamped_cy = cy.min(self.rows.len() - 1);
+        let chars: Vec<char> = self.rows[clamped_cy].buffer.chars().collect();
+        let len = chars.len();
+        let mut idx = cx.min(len);
+
+        if idx >= len {
+            if clamped_cy + 1 < self.rows.len() {
+                return (0, clamped_cy + 1);
+            }
+            return (len, clamped_cy);
+        }
+
+        while idx < len && classify_char(chars[idx]) == CharClass::Whitespace {
+            idx += 1;
+        }
+        if idx < len {
+            let target_class = classify_char(chars[idx]);
+            while idx < len && classify_char(chars[idx]) == target_class {
+                idx += 1;
+            }
+        }
+        (idx, clamped_cy)
+    }
+
+    /// Deletes from `(cx, cy)` back to the previous word boundary, returning the new `(cx, cy)`.
+    pub fn delete_word_left(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
+        if cy >= self.rows.len() {
+            return None;
+        }
+        let (target_cx, target_cy) = self.word_boundary_left(cx, cy);
+        if (target_cx, target_cy) == (cx, cy) {
+            return None;
+        }
+        if target_cy < cy {
+            return self.delete_char(0, cy);
+        }
+
+        let clamped_cx = cx.min(self.rows[cy].len);
+        let count = clamped_cx.saturating_sub(target_cx);
+        if count == 0 {
+            return None;
+        }
+        self.record_snapshot(cx, cy);
+        for _ in 0..count {
+            self.rows[cy].delete_char(target_cx);
+        }
+        if self.rows.len() == 1 && self.rows[0].len == 0 {
+            self.rows.clear();
+        }
+        self.dirty = true;
+        Some((target_cx, cy))
+    }
+
+    /// Deletes from `(cx, cy)` forward to the next word boundary, returning `true` if text was removed.
+    pub fn delete_word_right(&mut self, cx: usize, cy: usize) -> bool {
+        if cy >= self.rows.len() {
+            return false;
+        }
+        let (target_cx, target_cy) = self.word_boundary_right(cx, cy);
+        if (target_cx, target_cy) == (cx, cy) {
+            return false;
+        }
+        if target_cy > cy {
+            return self.delete_forward(self.rows[cy].len, cy);
+        }
+
+        let clamped_cx = cx.min(self.rows[cy].len);
+        let count = target_cx.saturating_sub(clamped_cx);
+        if count == 0 {
+            return false;
+        }
+        self.record_snapshot(cx, cy);
+        for _ in 0..count {
+            self.rows[cy].delete_char(clamped_cx);
+        }
+        if self.rows.len() == 1 && self.rows[0].len == 0 {
+            self.rows.clear();
+        }
+        self.dirty = true;
+        true
     }
 
     /// Performs a backspace operation from `(cx, cy)`, returning the new `(cx, cy)` cursor
@@ -886,7 +1155,26 @@ impl Buffer {
         }
     }
 
+    /// Deletes the entire row at `cy`, recording an undo snapshot and returning the clamped
+    /// `(new_cx, new_cy)` cursor position if a line was removed.
+    pub fn delete_line(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
+        if cy >= self.rows.len() {
+            return None;
+        }
+        self.record_snapshot(cx, cy);
+        self.rows.remove(cy);
+        self.dirty = true;
+        if self.rows.is_empty() {
+            Some((0, 0))
+        } else {
+            let new_cy = cy.min(self.rows.len() - 1);
+            let new_cx = cx.min(self.rows[new_cy].len);
+            Some((new_cx, new_cy))
+        }
+    }
+
     /// Serializes the buffer rows joined by `\n`.
+    #[allow(dead_code)]
     pub fn contents(&self) -> String {
         self.rows
             .iter()
@@ -1186,5 +1474,27 @@ mod tests {
         buf.delete_char(1, 0);
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn buffer_delete_line_removes_row_clamps_cursor_and_supports_undo() {
+        let mut buf = Buffer::from_lines(&["first line", "second", "third line"]);
+        // Delete middle line
+        let pos = buf.delete_line(4, 1);
+        assert_eq!(pos, Some((4, 1)));
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.contents(), "first line\nthird line");
+        assert!(buf.dirty);
+
+        // Undo restores the deleted middle line and cursor position
+        let restored = buf.undo(4, 1);
+        assert_eq!(restored, Some((4, 1)));
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.contents(), "first line\nsecond\nthird line");
+
+        // Deleting the last line clamps cy to the new last line
+        let last_pos = buf.delete_line(8, 2);
+        assert_eq!(last_pos, Some((6, 1)));
+        assert_eq!(buf.len(), 2);
     }
 }
