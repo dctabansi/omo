@@ -1,6 +1,8 @@
 use anyhow::Result;
 use crossterm::{
-    cursor, execute,
+    cursor,
+    event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    execute,
     style::ResetColor,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -19,6 +21,11 @@ impl Terminal {
         enable_raw_mode()?;
         let term = Self;
         execute!(stdout(), EnterAlternateScreen, Clear(ClearType::All))?;
+        let _ = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            crossterm::style::Print("\x1b[>4;1m")
+        );
         Ok(term)
     }
 
@@ -38,6 +45,11 @@ impl Terminal {
 /// Restores the terminal to its normal state, guaranteeing cleanup even if the program panics.
 impl Drop for Terminal {
     fn drop(&mut self) {
+        let _ = execute!(
+            stdout(),
+            crossterm::style::Print("\x1b[>4;0m"),
+            PopKeyboardEnhancementFlags
+        );
         let _ = execute!(stdout(), ResetColor, cursor::Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
