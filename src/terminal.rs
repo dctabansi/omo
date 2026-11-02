@@ -17,8 +17,9 @@ impl Terminal {
     /// Takes over the terminal: enters raw mode and switches to the alternate screen.
     pub fn initialize() -> Result<Self> {
         enable_raw_mode()?;
+        let term = Self;
         execute!(stdout(), EnterAlternateScreen, Clear(ClearType::All))?;
-        Ok(Self)
+        Ok(term)
     }
 
     /// Alias for [`Terminal::initialize`].
