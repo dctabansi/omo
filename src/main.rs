@@ -30,7 +30,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction> {
             if arg == "-h" || arg == "--help" {
                 return Ok(CliAction::PrintHelp);
             }
-            if arg == "-v" || arg == "-V" || arg == "--version" {
+            if arg == "--version" || arg == "-v" {
                 return Ok(CliAction::PrintVersion);
             }
             if arg.starts_with('-') && arg.len() > 1 {
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
     let filename = match parse_cli_args(&args)? {
         CliAction::PrintHelp => {
             println!(
-                "omo {} — One Mode Only terminal text editor\n\nUsage:\n  omo [FILE]\n\nOptions:\n  -h, --help     Print help\n  -v, -V, --version  Print version",
+                "omo {} — One Mode Only terminal text editor\n\nUsage:\n  omo [FILE]\n\nOptions:\n  -h, --help     Print help\n  -v, --version  Print version",
                 env!("CARGO_PKG_VERSION")
             );
             return Ok(());
@@ -92,11 +92,14 @@ mod tests {
         let help = vec!["omo".to_string(), "--help".to_string()];
         assert_eq!(parse_cli_args(&help).unwrap(), CliAction::PrintHelp);
 
-        let version = vec!["omo".to_string(), "-V".to_string()];
+        let version = vec!["omo".to_string(), "--version".to_string()];
         assert_eq!(parse_cli_args(&version).unwrap(), CliAction::PrintVersion);
 
         let short_v = vec!["omo".to_string(), "-v".to_string()];
         assert_eq!(parse_cli_args(&short_v).unwrap(), CliAction::PrintVersion);
+
+        let capital_v = vec!["omo".to_string(), "-V".to_string()];
+        assert!(parse_cli_args(&capital_v).is_err());
 
         let file = vec!["omo".to_string(), "notes.txt".to_string()];
         assert_eq!(
