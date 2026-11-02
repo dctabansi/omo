@@ -95,7 +95,8 @@ impl Editor {
     }
 
     pub fn with_config(mut buffer: Buffer, config: Config) -> Self {
-        buffer.set_tab_width(config.tab_width);
+        let (tab_width, _) = config.resolve_filetype_settings(buffer.filename.as_deref());
+        buffer.set_tab_width(tab_width);
         Self {
             should_quit: false,
             buffer,
@@ -356,6 +357,27 @@ impl Editor {
         self.desired_cx = self.visual_cx();
     }
 
+    /// Inserts either soft-tab spaces up to the next tab stop (when `expand_tabs` is `true`
+    /// for the active file type) or a literal `'\t'` character (when `expand_tabs` is `false`).
+    pub fn insert_tab(&mut self) {
+        let (tab_width, expand_tabs) = self
+            .config
+            .resolve_filetype_settings(self.buffer.filename.as_deref());
+        if expand_tabs {
+            let step = tab_width.max(1);
+            let spaces = step - (self.visual_cx() % step);
+            self.buffer.break_undo_coalesce();
+            self.buffer.record_snapshot(self.cx, self.cy);
+            for _ in 0..spaces {
+                self.buffer.insert_char_no_snapshot(self.cx, self.cy, ' ');
+                self.cx += 1;
+            }
+            self.desired_cx = self.visual_cx();
+        } else {
+            self.insert_char('\t');
+        }
+    }
+
     /// Splits the current line at the cursor (preserving indentation when `auto_indent` is enabled)
     /// and moves to the new line.
     pub fn insert_newline(&mut self) {
@@ -588,6 +610,10 @@ impl Editor {
                         } else {
                             match self.buffer.save_as(&trimmed) {
                                 Ok(bytes) => {
+                                    let (tab_width, _) = self
+                                        .config
+                                        .resolve_filetype_settings(self.buffer.filename.as_deref());
+                                    self.buffer.set_tab_width(tab_width);
                                     self.status_message =
                                         Some(format!("Wrote {bytes} bytes to {trimmed}"));
                                 }
@@ -816,7 +842,7 @@ impl Editor {
             EditorCommand::InsertNewline => self.insert_newline(),
             EditorCommand::Backspace => self.backspace(),
             EditorCommand::Delete => self.delete_forward(),
-            EditorCommand::InsertTab => self.insert_char('\t'),
+            EditorCommand::InsertTab => self.insert_tab(),
             EditorCommand::Noop => {}
         }
     }
@@ -1168,17 +1194,24 @@ mod tests {
 
     #[test]
     fn tab_insertion_and_visual_cursor_align_with_expanded_tab_stops() {
-        let mut editor = Editor::new(Buffer::new());
+        let mut editor = Editor::new(Buffer::with_filename("Makefile"));
         editor.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 24);
         editor.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), 24);
 
-        // Logical buffer stores raw '\t' + 'x' (2 chars), while render expands '\t' to 4 spaces (5 visual cols)
+        // Makefile uses hard tabs (expand_tabs = false): stores raw '\t' + 'x', renders 4 spaces + 'x'
         assert_eq!(editor.buffer.contents(), "\tx");
         assert_eq!(editor.buffer.get_row(0).unwrap().render, "    x");
         assert_eq!(editor.cx, 2);
         assert_eq!(editor.visual_cx(), 5);
         // Gutter width for 1 line is 3 (" 1 "), so screen_cx is 3 + 5 = 8
         assert_eq!(editor.cursor_screen_position(), (8, 0));
+
+        // YAML file defaults to 2-space soft tabs (expand_tabs = true, tab_width = 2)
+        let mut yaml_editor = Editor::new(Buffer::with_filename("config.yaml"));
+        yaml_editor.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 24);
+        yaml_editor.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), 24);
+        assert_eq!(yaml_editor.buffer.contents(), "  k");
+        assert_eq!(yaml_editor.cx, 3);
     }
 
     #[test]
