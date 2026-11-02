@@ -1,11 +1,107 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use serde::Deserialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_TAB_WIDTH: usize = 4;
+
+pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# omo configuration file
+# Global fallback settings for files not matched in [filetypes]
+tab_width = 4
+expand_tabs = true
+auto_indent = true
+
+[filetypes]
+# Per-filetype tab_width and expand_tabs (true = spaces, false = literal '\t')
+bash        = { tab_width = 4, expand_tabs = true }
+c           = { tab_width = 4, expand_tabs = true }
+cc          = { tab_width = 4, expand_tabs = true }
+cjs         = { tab_width = 2, expand_tabs = true }
+cpp         = { tab_width = 4, expand_tabs = true }
+css         = { tab_width = 2, expand_tabs = true }
+gnumakefile = { tab_width = 4, expand_tabs = false }
+go          = { tab_width = 4, expand_tabs = false }
+h           = { tab_width = 4, expand_tabs = true }
+hpp         = { tab_width = 4, expand_tabs = true }
+htm         = { tab_width = 2, expand_tabs = true }
+html        = { tab_width = 2, expand_tabs = true }
+java        = { tab_width = 4, expand_tabs = true }
+js          = { tab_width = 2, expand_tabs = true }
+json        = { tab_width = 2, expand_tabs = true }
+jsonc       = { tab_width = 2, expand_tabs = true }
+jsx         = { tab_width = 2, expand_tabs = true }
+justfile    = { tab_width = 4, expand_tabs = true }
+kt          = { tab_width = 4, expand_tabs = true }
+kts         = { tab_width = 4, expand_tabs = true }
+lua         = { tab_width = 2, expand_tabs = true }
+makefile    = { tab_width = 4, expand_tabs = false }
+markdown    = { tab_width = 2, expand_tabs = true }
+md          = { tab_width = 2, expand_tabs = true }
+mjs         = { tab_width = 2, expand_tabs = true }
+mk          = { tab_width = 4, expand_tabs = false }
+nix         = { tab_width = 2, expand_tabs = true }
+py          = { tab_width = 4, expand_tabs = true }
+rb          = { tab_width = 2, expand_tabs = true }
+rs          = { tab_width = 4, expand_tabs = true }
+scss        = { tab_width = 2, expand_tabs = true }
+sh          = { tab_width = 4, expand_tabs = true }
+svg         = { tab_width = 2, expand_tabs = true }
+toml        = { tab_width = 2, expand_tabs = true }
+ts          = { tab_width = 2, expand_tabs = true }
+tsx         = { tab_width = 2, expand_tabs = true }
+xml         = { tab_width = 2, expand_tabs = true }
+yaml        = { tab_width = 2, expand_tabs = true }
+yml         = { tab_width = 2, expand_tabs = true }
+zsh         = { tab_width = 4, expand_tabs = true }
+
+[keys]
+"ctrl+q"           = "quit"
+"alt+q"            = "quit"
+"ctrl+s"           = "save"
+"alt+s"            = "save"
+"f2"               = "save"
+"ctrl+z"           = "undo"
+"alt+z"            = "undo"
+"ctrl+y"           = "redo"
+"alt+y"            = "redo"
+"ctrl+shift+z"     = "redo"
+"ctrl+d"           = "duplicate_line"
+"alt+d"            = "duplicate_line"
+"ctrl+shift+d"     = "delete_line"
+"alt+shift+d"      = "delete_line"
+"shift+enter"      = "insert_line_below"
+"ctrl+enter"       = "insert_line_below"
+"alt+enter"        = "insert_line_below"
+"ctrl+j"           = "insert_line_below"
+"ctrl+shift+enter" = "insert_line_above"
+"ctrl+alt+enter"   = "insert_line_above"
+"alt+shift+enter"  = "insert_line_above"
+"shift+tab"        = "unindent"
+"ctrl+left"        = "word_left"
+"alt+left"         = "word_left"
+"ctrl+right"       = "word_right"
+"alt+right"        = "word_right"
+"ctrl+backspace"   = "delete_word_left"
+"alt+backspace"    = "delete_word_left"
+"ctrl+w"           = "delete_word_left"
+"ctrl+h"           = "delete_word_left"
+"ctrl+delete"      = "delete_word_right"
+"alt+delete"       = "delete_word_right"
+"ctrl+g"           = "goto_line"
+"alt+g"            = "goto_line"
+"ctrl+f"           = "find"
+"alt+f"            = "find"
+"f3"               = "find"
+
+[theme]
+# Optional 24-bit RGB colors: [R, G, B]
+# background = [30, 30, 46]
+# foreground = [205, 214, 244]
+# status_bg  = [49, 50, 68]
+# status_fg  = [180, 190, 254]
+"#;
 
 fn default_tab_width() -> usize {
     DEFAULT_TAB_WIDTH
@@ -19,11 +115,45 @@ where
     Ok(if raw == 0 { DEFAULT_TAB_WIDTH } else { raw })
 }
 
+fn deserialize_optional_tab_width<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<usize>::deserialize(deserializer)?;
+    Ok(raw.map(|w| if w == 0 { DEFAULT_TAB_WIDTH } else { w }))
+}
+
+fn default_expand_tabs() -> bool {
+    true
+}
+
 fn default_auto_indent() -> bool {
     true
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileTypeConfig {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_tab_width",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tab_width: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expand_tabs: Option<bool>,
+}
+
+fn serialize_sorted_map<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    V: Serialize,
+{
+    let ordered: BTreeMap<&String, &V> = map.iter().collect();
+    ordered.serialize(serializer)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     #[serde(
@@ -31,23 +161,39 @@ pub struct Config {
         deserialize_with = "deserialize_tab_width"
     )]
     pub tab_width: usize,
+    #[serde(default = "default_expand_tabs")]
+    pub expand_tabs: bool,
     #[serde(default = "default_auto_indent")]
     pub auto_indent: bool,
-    pub theme: ThemeConfig,
-    #[serde(deserialize_with = "deserialize_keys")]
+    #[serde(
+        default = "default_filetypes",
+        deserialize_with = "deserialize_filetypes",
+        serialize_with = "serialize_sorted_map"
+    )]
+    pub filetypes: HashMap<String, FileTypeConfig>,
+    #[serde(
+        default = "default_keys",
+        deserialize_with = "deserialize_keys",
+        serialize_with = "serialize_sorted_map"
+    )]
     pub keys: HashMap<String, Action>,
+    pub theme: ThemeConfig,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<(u8, u8, u8)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub foreground: Option<(u8, u8, u8)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status_bg: Option<(u8, u8, u8)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status_fg: Option<(u8, u8, u8)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     Quit,
@@ -65,6 +211,69 @@ pub enum Action {
     DeleteWordLeft,
     DeleteWordRight,
     GotoLine,
+}
+
+pub fn default_filetypes() -> HashMap<String, FileTypeConfig> {
+    let mut map = HashMap::new();
+    let two_space = FileTypeConfig {
+        tab_width: Some(2),
+        expand_tabs: Some(true),
+    };
+    for ext in [
+        "yaml", "yml", "json", "jsonc", "toml", "html", "htm", "xml", "svg", "css", "scss", "js",
+        "mjs", "cjs", "jsx", "ts", "tsx", "rb", "lua", "nix", "md", "markdown",
+    ] {
+        map.insert(ext.to_string(), two_space);
+    }
+
+    let four_space = FileTypeConfig {
+        tab_width: Some(4),
+        expand_tabs: Some(true),
+    };
+    for ext in [
+        "rs", "py", "java", "kt", "kts", "c", "h", "cpp", "hpp", "cc", "sh", "bash", "zsh",
+        "justfile",
+    ] {
+        map.insert(ext.to_string(), four_space);
+    }
+
+    let hard_tab = FileTypeConfig {
+        tab_width: Some(4),
+        expand_tabs: Some(false),
+    };
+    for ext in ["makefile", "gnumakefile", "mk", "go"] {
+        map.insert(ext.to_string(), hard_tab);
+    }
+
+    map
+}
+
+fn normalize_filetype_key(raw: &str) -> String {
+    raw.trim().trim_start_matches('.').to_ascii_lowercase()
+}
+
+fn deserialize_filetypes<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, FileTypeConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: HashMap<String, FileTypeConfig> = HashMap::deserialize(deserializer)?;
+    let mut merged = default_filetypes();
+    for (k, v) in raw {
+        let key = normalize_filetype_key(&k);
+        if key.is_empty() {
+            continue;
+        }
+        let entry = merged.entry(key).or_default();
+        if v.tab_width.is_some() {
+            entry.tab_width = v.tab_width;
+        }
+        if v.expand_tabs.is_some() {
+            entry.expand_tabs = v.expand_tabs;
+        }
+    }
+    Ok(merged)
 }
 
 pub fn default_keys() -> HashMap<String, Action> {
@@ -160,17 +369,60 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             tab_width: DEFAULT_TAB_WIDTH,
+            expand_tabs: true,
             auto_indent: true,
             theme: ThemeConfig::default(),
+            filetypes: default_filetypes(),
             keys: default_keys(),
         }
     }
 }
 
 impl Config {
-    /// Parses a TOML configuration string, merging user keybindings with defaults.
+    /// Parses a TOML configuration string, merging user keybindings and filetype settings with defaults.
     pub fn from_toml_str(contents: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(contents)
+    }
+
+    /// Serializes this configuration into a formatted TOML string.
+    pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
+
+    /// Returns the primary configuration file path where settings are saved/restored.
+    pub fn primary_config_path() -> PathBuf {
+        Self::config_paths()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| PathBuf::from("config.toml"))
+    }
+
+    /// Resolves `(tab_width, expand_tabs)` for the given `filename`, checking `[filetypes]`
+    /// by file extension and basename before falling back to top-level `tab_width` and `expand_tabs`.
+    pub fn resolve_filetype_settings(&self, filename: Option<&str>) -> (usize, bool) {
+        if let Some(name) = filename {
+            let path = Path::new(name);
+            let ext_key = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(normalize_filetype_key);
+            let base_key = path
+                .file_name()
+                .and_then(|b| b.to_str())
+                .map(normalize_filetype_key);
+
+            let matched = ext_key
+                .as_deref()
+                .and_then(|k| self.filetypes.get(k))
+                .or_else(|| base_key.as_deref().and_then(|k| self.filetypes.get(k)));
+
+            if let Some(ft) = matched {
+                let tw = ft.tab_width.unwrap_or(self.tab_width).max(1);
+                let expand = ft.expand_tabs.unwrap_or(self.expand_tabs);
+                return (tw, expand);
+            }
+        }
+        (self.tab_width.max(1), self.expand_tabs)
     }
 
     /// Resolves candidate configuration file paths across Unix and Windows environments
@@ -519,6 +771,43 @@ status_fg = [186, 194, 222]
                 .join("omo")
                 .join("config.toml")
         );
+    }
+
+    #[test]
+    fn filetype_settings_resolve_built_in_defaults_and_user_overrides() {
+        let toml_input = r#"
+tab_width = 4
+expand_tabs = true
+
+[filetypes]
+go = { expand_tabs = true }
+yaml = { tab_width = 4 }
+custom = { tab_width = 8, expand_tabs = false }
+"#;
+        let cfg = Config::from_toml_str(toml_input).unwrap();
+        // Built-in defaults
+        assert_eq!(
+            cfg.resolve_filetype_settings(Some("config.json")),
+            (2, true)
+        );
+        assert_eq!(cfg.resolve_filetype_settings(Some("Makefile")), (4, false));
+        assert_eq!(
+            cfg.resolve_filetype_settings(Some("src/main.rs")),
+            (4, true)
+        );
+        // User overrides merged with built-in defaults
+        assert_eq!(cfg.resolve_filetype_settings(Some("main.go")), (4, true));
+        assert_eq!(
+            cfg.resolve_filetype_settings(Some("docker-compose.yaml")),
+            (4, true)
+        );
+        assert_eq!(
+            cfg.resolve_filetype_settings(Some("data.custom")),
+            (8, false)
+        );
+        // Default template parses cleanly
+        let template_cfg = Config::from_toml_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        assert_eq!(template_cfg, Config::default());
     }
 
     #[test]

@@ -821,6 +821,16 @@ impl Buffer {
         None
     }
 
+    /// Inserts a character at buffer coordinates `(cx, cy)` without recording a new undo snapshot.
+    pub fn insert_char_no_snapshot(&mut self, cx: usize, cy: usize, c: char) {
+        while self.rows.len() <= cy {
+            self.rows.push(Row::with_tab_width("", self.tab_width));
+        }
+        self.rows[cy].insert_char(cx, c);
+        self.dirty = true;
+        self.coalesce_insert_pos = None;
+    }
+
     /// Inserts a character at buffer coordinates `(cx, cy)`, coalescing contiguous
     /// non-whitespace typing on the same line into a single undo snapshot.
     pub fn insert_char(&mut self, cx: usize, cy: usize, c: char) {
