@@ -46,7 +46,7 @@ omo
 Check version or usage help:
 
 ```bash
-omo -v          # or: omo -V / omo --version
+omo --version   # or: omo -v
 omo --help      # or: omo -h
 ```
 
