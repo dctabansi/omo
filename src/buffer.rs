@@ -1,10 +1,130 @@
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 
 use crate::config::DEFAULT_TAB_WIDTH;
 
 const DEFAULT_GAP_SIZE: usize = 16;
+
+/// Replaces non-printable control characters (other than `\t`) with the Unicode replacement
+/// character so raw-mode terminal rendering cannot execute control codes or escape sequences.
+pub fn sanitize_render_char(c: char) -> char {
+    if c != '\t' && c.is_control() {
+        '\u{FFFD}'
+    } else {
+        c
+    }
+}
+
+/// Returns the terminal display column width (`0`, `1`, or `2`) of a single character.
+pub fn char_display_width(c: char) -> usize {
+    if c.is_control() {
+        return 0;
+    }
+    let u = c as u32;
+    // Zero-width combining marks, format characters, and variation selectors
+    if matches!(
+        u,
+        0x0300..=0x036F
+            | 0x0483..=0x0489
+            | 0x0591..=0x05BD
+            | 0x05BF
+            | 0x05C1..=0x05C2
+            | 0x05C4..=0x05C5
+            | 0x05C7
+            | 0x0610..=0x061A
+            | 0x064B..=0x065F
+            | 0x0670
+            | 0x06D6..=0x06DC
+            | 0x06DF..=0x06E4
+            | 0x06E7..=0x06E8
+            | 0x06EA..=0x06ED
+            | 0x0711
+            | 0x0730..=0x074A
+            | 0x07A6..=0x07B0
+            | 0x07EB..=0x07F3
+            | 0x0E31
+            | 0x0E34..=0x0E3A
+            | 0x0E47..=0x0E4E
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x20D0..=0x20FF
+            | 0xFE00..=0xFE0F
+            | 0xFE20..=0xFE2F
+            | 0xFEFF
+            | 0xE0100..=0xE01EF
+    ) {
+        return 0;
+    }
+
+    // Wide (2-column) East Asian, Fullwidth, and Emoji characters
+    if matches!(
+        u,
+        0x1100..=0x115F
+            | 0x231A..=0x231B
+            | 0x2329..=0x232A
+            | 0x23E9..=0x23F3
+            | 0x23F8..=0x23FA
+            | 0x25FD..=0x25FE
+            | 0x2614..=0x2615
+            | 0x2648..=0x2653
+            | 0x267F
+            | 0x2693
+            | 0x26A1
+            | 0x26AA..=0x26AB
+            | 0x26BD..=0x26BE
+            | 0x26C4..=0x26C5
+            | 0x26CE
+            | 0x26D4
+            | 0x26EA
+            | 0x26F2..=0x26F3
+            | 0x26F5
+            | 0x26FA
+            | 0x26FD
+            | 0x2705
+            | 0x270A..=0x270B
+            | 0x2728
+            | 0x274C
+            | 0x274E
+            | 0x2753..=0x2755
+            | 0x2757
+            | 0x2795..=0x2797
+            | 0x27B0
+            | 0x27BF
+            | 0x2B1B..=0x2B1C
+            | 0x2B50
+            | 0x2B55
+            | 0x2E80..=0x303E
+            | 0x3040..=0x33BF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0xA4CF
+            | 0xA960..=0xA97F
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF01..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F000..=0x1FAFF
+            | 0x20000..=0x2FFFD
+            | 0x30000..=0x3FFFD
+    ) {
+        return 2;
+    }
+
+    1
+}
+
+/// Returns the total terminal display column width of a string slice.
+pub fn str_display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| char_display_width(sanitize_render_char(c)))
+        .sum()
+}
 
 /// A character-indexed gap buffer with a movable gap `[gap_start..gap_end]` that provides
 /// O(1) amortized character insertions and deletions at the cursor column.
@@ -232,7 +352,7 @@ impl Row {
     }
 
     /// Recomputes `self.render`, `self.render_len`, and `self.len` from `self.buffer`,
-    /// expanding `\t` characters to `self.tab_width` tab stops.
+    /// expanding `\t` characters to `self.tab_width` tab stops and replacing control characters.
     pub fn update_render(&mut self) {
         let tab_w = self.tab_width.max(1);
         self.len = self.buffer.len();
@@ -246,8 +366,9 @@ impl Row {
                 }
                 rx += spaces;
             } else {
-                rendered.push(c);
-                rx += 1;
+                let safe = sanitize_render_char(c);
+                rendered.push(safe);
+                rx += char_display_width(safe);
             }
         }
         self.render = rendered;
@@ -255,7 +376,7 @@ impl Row {
     }
 
     /// Converts a logical character column `cx` into a visual render column `rx`,
-    /// accounting for expanded tab stops.
+    /// accounting for expanded tab stops and character display widths.
     pub fn cx_to_rx(&self, cx: usize) -> usize {
         let tab_w = self.tab_width.max(1);
         let mut rx = 0;
@@ -263,7 +384,7 @@ impl Row {
             if c == '\t' {
                 rx += tab_w - (rx % tab_w);
             } else {
-                rx += 1;
+                rx += char_display_width(sanitize_render_char(c));
             }
         }
         if cx > self.len {
@@ -273,7 +394,6 @@ impl Row {
     }
 
     /// Converts a visual render column `target_rx` into the corresponding logical character column `cx`.
-    #[allow(dead_code)]
     pub fn rx_to_cx(&self, target_rx: usize) -> usize {
         let tab_w = self.tab_width.max(1);
         let mut rx = 0;
@@ -281,7 +401,7 @@ impl Row {
             let next_rx = if c == '\t' {
                 rx + (tab_w - (rx % tab_w))
             } else {
-                rx + 1
+                rx + char_display_width(sanitize_render_char(c))
             };
             if next_rx > target_rx {
                 return cx;
@@ -326,25 +446,82 @@ impl Row {
         self.update_render();
     }
 
-    /// Returns a UTF-8 character-safe horizontal slice of the tab-expanded `render` string
-    /// for viewport rendering.
+    /// Returns a display-column-safe horizontal slice of the tab-expanded `render` string
+    /// for viewport rendering within `max_cols` terminal columns.
     pub fn slice_chars(&self, col_offset: usize, max_cols: usize) -> String {
-        self.render
-            .chars()
-            .skip(col_offset)
-            .take(max_cols)
-            .collect()
+        if max_cols == 0 {
+            return String::new();
+        }
+        let end_col = col_offset.saturating_add(max_cols);
+        let mut out = String::new();
+        let mut col = 0;
+        let mut started = false;
+
+        for c in self.render.chars() {
+            let w = char_display_width(c);
+            if w == 0 {
+                if started && col <= end_col {
+                    out.push(c);
+                }
+                continue;
+            }
+            let next_col = col + w;
+            if next_col <= col_offset {
+                col = next_col;
+                continue;
+            }
+            if col < col_offset && next_col > col_offset {
+                for _ in col_offset..next_col.min(end_col) {
+                    out.push(' ');
+                }
+                started = true;
+                col = next_col;
+                continue;
+            }
+            if next_col > end_col {
+                break;
+            }
+            out.push(c);
+            started = true;
+            col = next_col;
+        }
+        out
     }
 
-    /// Returns all character start indices where `query` matches within this row.
+    /// Returns all character start indices (including overlapping occurrences) where `query`
+    /// matches within this row (case-insensitive by default).
     pub fn find_matches(&self, query: &str) -> Vec<usize> {
+        self.find_matches_with_case(query, false)
+    }
+
+    /// Returns all character start indices (including overlapping occurrences) where `query`
+    /// matches within this row, honoring `case_sensitive`.
+    pub fn find_matches_with_case(&self, query: &str, case_sensitive: bool) -> Vec<usize> {
         if query.is_empty() {
             return Vec::new();
         }
-        let text = self.text();
-        text.match_indices(query)
-            .map(|(byte_idx, _)| text[..byte_idx].chars().count())
-            .collect()
+        let row_chars: Vec<char> = self.buffer.chars().collect();
+        let query_chars: Vec<char> = query.chars().collect();
+        let qlen = query_chars.len();
+        if qlen > row_chars.len() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        for start in 0..=(row_chars.len() - qlen) {
+            let matched = if case_sensitive {
+                row_chars[start..start + qlen] == query_chars[..]
+            } else {
+                row_chars[start..start + qlen]
+                    .iter()
+                    .zip(query_chars.iter())
+                    .all(|(rc, qc)| rc.to_lowercase().eq(qc.to_lowercase()))
+            };
+            if matched {
+                matches.push(start);
+            }
+        }
+        matches
     }
 }
 
@@ -365,8 +542,11 @@ pub struct Buffer {
     pub filename: Option<String>,
     pub dirty: bool,
     pub tab_width: usize,
-    undo_stack: Vec<BufferSnapshot>,
+    pub trailing_newline: bool,
+    pub crlf: bool,
+    undo_stack: VecDeque<BufferSnapshot>,
     redo_stack: Vec<BufferSnapshot>,
+    coalesce_insert_pos: Option<(usize, usize)>,
 }
 
 impl Default for Buffer {
@@ -376,8 +556,11 @@ impl Default for Buffer {
             filename: None,
             dirty: false,
             tab_width: DEFAULT_TAB_WIDTH,
-            undo_stack: Vec::new(),
+            trailing_newline: true,
+            crlf: false,
+            undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
+            coalesce_insert_pos: None,
         }
     }
 }
@@ -395,8 +578,11 @@ impl Buffer {
             filename: Some(filename.into()),
             dirty: false,
             tab_width: DEFAULT_TAB_WIDTH,
-            undo_stack: Vec::new(),
+            trailing_newline: true,
+            crlf: false,
+            undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
+            coalesce_insert_pos: None,
         }
     }
 
@@ -408,8 +594,11 @@ impl Buffer {
             filename: None,
             dirty: false,
             tab_width: DEFAULT_TAB_WIDTH,
-            undo_stack: Vec::new(),
+            trailing_newline: true,
+            crlf: false,
+            undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
+            coalesce_insert_pos: None,
         }
     }
 
@@ -418,17 +607,29 @@ impl Buffer {
     pub fn open(filename: &str) -> Result<Self> {
         match fs::read_to_string(filename) {
             Ok(contents) => {
+                let crlf = contents.contains("\r\n");
+                let trailing_newline = contents.is_empty() || contents.ends_with('\n');
                 let mut rows = Vec::new();
-                for line in contents.lines() {
-                    rows.push(Row::from(line));
+                if !contents.is_empty() {
+                    let body = contents
+                        .strip_suffix("\r\n")
+                        .or_else(|| contents.strip_suffix('\n'))
+                        .unwrap_or(&contents);
+                    for line in body.split('\n') {
+                        let clean = line.strip_suffix('\r').unwrap_or(line);
+                        rows.push(Row::from(clean));
+                    }
                 }
                 Ok(Self {
                     rows,
                     filename: Some(filename.to_string()),
                     dirty: false,
                     tab_width: DEFAULT_TAB_WIDTH,
-                    undo_stack: Vec::new(),
+                    trailing_newline,
+                    crlf,
+                    undo_stack: VecDeque::new(),
                     redo_stack: Vec::new(),
+                    coalesce_insert_pos: None,
                 })
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -447,24 +648,30 @@ impl Buffer {
         }
     }
 
+    /// Breaks any active character-insertion undo coalescing group.
+    pub fn break_undo_coalesce(&mut self) {
+        self.coalesce_insert_pos = None;
+    }
+
     /// Records the current buffer state onto `undo_stack` and clears `redo_stack`.
     pub fn record_snapshot(&mut self, cx: usize, cy: usize) {
         if self.undo_stack.len() >= MAX_UNDO_HISTORY {
-            self.undo_stack.remove(0);
+            self.undo_stack.pop_front();
         }
-        self.undo_stack.push(BufferSnapshot {
+        self.undo_stack.push_back(BufferSnapshot {
             rows: self.rows.clone(),
             cx,
             cy,
             dirty: self.dirty,
         });
         self.redo_stack.clear();
+        self.coalesce_insert_pos = None;
     }
 
     /// Restores the most recent snapshot from `undo_stack`, pushing the current state to
     /// `redo_stack`, and returns the restored `(cx, cy)` cursor coordinates.
     pub fn undo(&mut self, current_cx: usize, current_cy: usize) -> Option<(usize, usize)> {
-        let snapshot = self.undo_stack.pop()?;
+        let snapshot = self.undo_stack.pop_back()?;
         self.redo_stack.push(BufferSnapshot {
             rows: self.rows.clone(),
             cx: current_cx,
@@ -473,6 +680,7 @@ impl Buffer {
         });
         self.rows = snapshot.rows;
         self.dirty = snapshot.dirty;
+        self.coalesce_insert_pos = None;
         Some((snapshot.cx, snapshot.cy))
     }
 
@@ -480,7 +688,10 @@ impl Buffer {
     /// `undo_stack`, and returns the restored `(cx, cy)` cursor coordinates.
     pub fn redo(&mut self, current_cx: usize, current_cy: usize) -> Option<(usize, usize)> {
         let snapshot = self.redo_stack.pop()?;
-        self.undo_stack.push(BufferSnapshot {
+        if self.undo_stack.len() >= MAX_UNDO_HISTORY {
+            self.undo_stack.pop_front();
+        }
+        self.undo_stack.push_back(BufferSnapshot {
             rows: self.rows.clone(),
             cx: current_cx,
             cy: current_cy,
@@ -488,17 +699,31 @@ impl Buffer {
         });
         self.rows = snapshot.rows;
         self.dirty = snapshot.dirty;
+        self.coalesce_insert_pos = None;
         Some((snapshot.cx, snapshot.cy))
     }
 
-    /// Searches for `query` starting from `(start_cx, start_cy)` in `forward` or backward order,
-    /// wrapping around the buffer and returning `(match_cx, match_cy)` in character coordinates.
+    /// Searches for `query` (case-insensitive) starting from `(start_cx, start_cy)` in `forward`
+    /// or backward order, wrapping around the buffer and returning `(match_cx, match_cy)`.
     pub fn find(
         &self,
         query: &str,
         start_cx: usize,
         start_cy: usize,
         forward: bool,
+    ) -> Option<(usize, usize)> {
+        self.find_with_case(query, start_cx, start_cy, forward, false)
+    }
+
+    /// Searches for `query` starting from `(start_cx, start_cy)` in `forward` or backward order
+    /// with configurable `case_sensitive` matching, wrapping around the buffer.
+    pub fn find_with_case(
+        &self,
+        query: &str,
+        start_cx: usize,
+        start_cy: usize,
+        forward: bool,
+        case_sensitive: bool,
     ) -> Option<(usize, usize)> {
         if query.is_empty() || self.rows.is_empty() {
             return None;
@@ -509,7 +734,7 @@ impl Buffer {
 
         if forward {
             if let Some(cx) = self.rows[clamped_cy]
-                .find_matches(query)
+                .find_matches_with_case(query, case_sensitive)
                 .into_iter()
                 .find(|&m| m >= start_cx)
             {
@@ -518,13 +743,17 @@ impl Buffer {
 
             for offset in 1..num_rows {
                 let row_idx = (clamped_cy + offset) % num_rows;
-                if let Some(cx) = self.rows[row_idx].find_matches(query).into_iter().next() {
+                if let Some(cx) = self.rows[row_idx]
+                    .find_matches_with_case(query, case_sensitive)
+                    .into_iter()
+                    .next()
+                {
                     return Some((cx, row_idx));
                 }
             }
 
             if let Some(cx) = self.rows[clamped_cy]
-                .find_matches(query)
+                .find_matches_with_case(query, case_sensitive)
                 .into_iter()
                 .find(|&m| m < start_cx)
             {
@@ -532,7 +761,7 @@ impl Buffer {
             }
         } else {
             if let Some(cx) = self.rows[clamped_cy]
-                .find_matches(query)
+                .find_matches_with_case(query, case_sensitive)
                 .into_iter()
                 .rev()
                 .find(|&m| m < start_cx)
@@ -543,7 +772,7 @@ impl Buffer {
             for offset in 1..num_rows {
                 let row_idx = (clamped_cy + num_rows - offset) % num_rows;
                 if let Some(cx) = self.rows[row_idx]
-                    .find_matches(query)
+                    .find_matches_with_case(query, case_sensitive)
                     .into_iter()
                     .next_back()
                 {
@@ -552,7 +781,7 @@ impl Buffer {
             }
 
             if let Some(cx) = self.rows[clamped_cy]
-                .find_matches(query)
+                .find_matches_with_case(query, case_sensitive)
                 .into_iter()
                 .rev()
                 .find(|&m| m >= start_cx)
@@ -564,14 +793,23 @@ impl Buffer {
         None
     }
 
-    /// Inserts a character at buffer coordinates `(cx, cy)`.
+    /// Inserts a character at buffer coordinates `(cx, cy)`, coalescing contiguous
+    /// non-whitespace typing on the same line into a single undo snapshot.
     pub fn insert_char(&mut self, cx: usize, cy: usize, c: char) {
-        self.record_snapshot(cx, cy);
+        let should_coalesce = self.coalesce_insert_pos == Some((cx, cy)) && !c.is_whitespace();
+        if !should_coalesce {
+            self.record_snapshot(cx, cy);
+        }
         while self.rows.len() <= cy {
             self.rows.push(Row::with_tab_width("", self.tab_width));
         }
         self.rows[cy].insert_char(cx, c);
         self.dirty = true;
+        self.coalesce_insert_pos = if c.is_whitespace() {
+            None
+        } else {
+            Some((cx + 1, cy))
+        };
     }
 
     /// Splits the row at `(cx, cy)` or inserts a new empty line when the buffer is empty.
@@ -600,6 +838,9 @@ impl Buffer {
             self.record_snapshot(cx, cy);
             let target_cx = cx.min(self.rows[cy].len) - 1;
             self.rows[cy].delete_char(target_cx);
+            if self.rows.len() == 1 && self.rows[0].len == 0 {
+                self.rows.clear();
+            }
             self.dirty = true;
             Some((target_cx, cy))
         } else if cy > 0 {
@@ -607,6 +848,9 @@ impl Buffer {
             let current_row = self.rows.remove(cy);
             let prev_len = self.rows[cy - 1].len;
             self.rows[cy - 1].append(&current_row);
+            if self.rows.len() == 1 && self.rows[0].len == 0 {
+                self.rows.clear();
+            }
             self.dirty = true;
             Some((prev_len, cy - 1))
         } else {
@@ -623,12 +867,18 @@ impl Buffer {
         if cx < self.rows[cy].len {
             self.record_snapshot(cx, cy);
             self.rows[cy].delete_char(cx);
+            if self.rows.len() == 1 && self.rows[0].len == 0 {
+                self.rows.clear();
+            }
             self.dirty = true;
             true
         } else if cy + 1 < self.rows.len() {
             self.record_snapshot(cx, cy);
             let next_row = self.rows.remove(cy + 1);
             self.rows[cy].append(&next_row);
+            if self.rows.len() == 1 && self.rows[0].len == 0 {
+                self.rows.clear();
+            }
             self.dirty = true;
             true
         } else {
@@ -657,10 +907,20 @@ impl Buffer {
     /// Writes the buffer to `filename`, updates `self.filename`, and clears `dirty`.
     pub fn save_as(&mut self, filename: impl Into<String>) -> Result<usize> {
         let filename = filename.into();
-        let data = self.contents();
+        let line_ending = if self.crlf { "\r\n" } else { "\n" };
+        let mut data = self
+            .rows
+            .iter()
+            .map(Row::text)
+            .collect::<Vec<_>>()
+            .join(line_ending);
+        if !self.rows.is_empty() && self.trailing_newline {
+            data.push_str(line_ending);
+        }
         fs::write(&filename, &data)?;
         self.filename = Some(filename);
         self.dirty = false;
+        self.coalesce_insert_pos = None;
         for snap in &mut self.undo_stack {
             snap.dirty = true;
         }
@@ -701,8 +961,10 @@ mod tests {
     #[test]
     fn row_slice_chars_handles_multibyte_boundaries_safely() {
         let row = Row::from("αβγ🦀δεζ");
-        assert_eq!(row.slice_chars(0, 4), "αβγ🦀");
-        assert_eq!(row.slice_chars(2, 3), "γ🦀δ");
+        // 'α', 'β', 'γ' are 1 col each; '🦀' is 2 cols (total 5 cols for "αβγ🦀")
+        assert_eq!(row.slice_chars(0, 5), "αβγ🦀");
+        assert_eq!(row.slice_chars(0, 4), "αβγ");
+        assert_eq!(row.slice_chars(2, 4), "γ🦀δ");
         assert_eq!(row.slice_chars(10, 5), "");
     }
 
@@ -858,5 +1120,71 @@ mod tests {
         // Backward search from second line finds first line match
         let backward = buf.find("needle", 7, 1, false);
         assert_eq!(backward, Some((4, 0)));
+    }
+
+    #[test]
+    fn row_sanitizes_control_chars_and_tracks_wide_unicode_columns() {
+        let row = Row::from("a\x1b\r🦀b");
+        assert_eq!(row.render, "a\u{FFFD}\u{FFFD}🦀b");
+        // 'a' (1) + '\x1b' (1) + '\r' (1) + '🦀' (2) + 'b' (1) = 6 display cols
+        assert_eq!(row.render_len, 6);
+        assert_eq!(row.cx_to_rx(3), 3);
+        assert_eq!(row.cx_to_rx(4), 5);
+        assert_eq!(row.rx_to_cx(4), 3);
+        assert_eq!(row.rx_to_cx(5), 4);
+    }
+
+    #[test]
+    fn buffer_preserves_trailing_blank_lines_and_crlf_on_roundtrip() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("omo_crlf_test_{nanos}.txt"));
+        let path_str = path.to_string_lossy().to_string();
+
+        fs::write(&path, "line1\r\nline2\r\n\r\n").unwrap();
+        let mut loaded = Buffer::open(&path_str).unwrap();
+        assert!(loaded.crlf);
+        assert!(loaded.trailing_newline);
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.get_row(2).unwrap().text(), "");
+
+        loaded.save().unwrap();
+        let disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(disk, "line1\r\nline2\r\n\r\n");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn row_find_matches_includes_overlapping_occurrences() {
+        let row = Row::from("ababa");
+        assert_eq!(row.find_matches("aba"), vec![0, 2]);
+    }
+
+    #[test]
+    fn buffer_coalesces_word_typing_and_normalizes_empty_buffer_rows() {
+        let mut buf = Buffer::new();
+        assert_eq!(buf.len(), 0);
+
+        // Contiguous word typing coalesces into a single undo snapshot
+        for (i, ch) in "hello".chars().enumerate() {
+            buf.insert_char(i, 0, ch);
+        }
+        assert_eq!(buf.contents(), "hello");
+        assert_eq!(buf.len(), 1);
+
+        let restored = buf.undo(5, 0);
+        assert_eq!(restored, Some((0, 0)));
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+
+        // Typing a single character and deleting it returns buffer to 0 rows
+        buf.insert_char(0, 0, 'x');
+        assert_eq!(buf.len(), 1);
+        buf.delete_char(1, 0);
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
     }
 }

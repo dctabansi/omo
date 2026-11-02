@@ -65,15 +65,15 @@ export VISUAL="omo"
 | `Up` / `Down` / `Left` / `Right` | Move cursor |
 | `Home` / `End` | Jump to start / end of line |
 | `PageUp` / `PageDown` | Scroll viewport up / down by page |
-| `Ctrl+S` | Save file (prompts for filename if unnamed) |
-| `Ctrl+Q` | Quit (`Ctrl+Q` twice to discard unsaved changes) |
-| `Ctrl+Z` | Undo |
-| `Ctrl+Y` | Redo |
-| `Ctrl+F` | Incremental search (`Enter`/`Down`/`Right` next, `Up`/`Left` previous, `Esc` cancel) |
+| `Ctrl+S` / `Alt+S` / `F2` | Save file (prompts for filename if unnamed) |
+| `Ctrl+Q` / `Alt+Q` | Quit (press twice to discard unsaved changes) |
+| `Ctrl+Z` / `Alt+Z` | Undo |
+| `Ctrl+Y` / `Alt+Y` / `Ctrl+Shift+Z` | Redo |
+| `Ctrl+F` / `Alt+F` / `F3` | Incremental search (`Enter` accept, `Up`/`Down` prev/next, `Alt+C` toggle case, `Esc` cancel) |
 
 ## Configuration
 
-`omo` requires no configuration to run. To customize settings, create `~/.config/omo/config.toml` (or `$XDG_CONFIG_HOME/omo/config.toml`):
+`omo` requires no configuration to run. To customize settings, create `~/.config/omo/config.toml` (or `$XDG_CONFIG_HOME/omo/config.toml`, or set `$OMO_CONFIG` to a custom file path):
 
 ```toml
 tab_width = 4
