@@ -50,6 +50,15 @@ omo --version   # or: omo -v
 omo --help      # or: omo -h
 ```
 
+Manage configuration from the CLI:
+
+```bash
+omo --config                  # or: omo -c (opens config.toml in omo, creating it with defaults if missing)
+omo --default                 # or: omo -d (restores default config.toml after confirmation)
+omo --export [FILE.toml]      # or: omo -e (exports active config to FILE.toml or ./omo-config.toml)
+omo --import <FILE.toml>      # or: omo -i (validates and imports FILE.toml after confirmation)
+```
+
 ### Use as Default Git Editor
 
 ```bash
@@ -93,13 +102,19 @@ export VISUAL="omo"
 
 ```toml
 tab_width = 4
+expand_tabs = true
 auto_indent = true
 
-[theme]
-background = [30, 30, 46]
-foreground = [205, 214, 244]
-status_bg  = [49, 50, 68]
-status_fg  = [180, 190, 254]
+[filetypes]
+go       = { tab_width = 4, expand_tabs = false }
+js       = { tab_width = 2, expand_tabs = true }
+json     = { tab_width = 2, expand_tabs = true }
+makefile = { tab_width = 4, expand_tabs = false }
+py       = { tab_width = 4, expand_tabs = true }
+rs       = { tab_width = 4, expand_tabs = true }
+toml     = { tab_width = 2, expand_tabs = true }
+ts       = { tab_width = 2, expand_tabs = true }
+yaml     = { tab_width = 2, expand_tabs = true }
 
 [keys]
 "ctrl+q" = "quit"
@@ -117,6 +132,12 @@ status_fg  = [180, 190, 254]
 "ctrl+delete" = "delete_word_right"
 "ctrl+g" = "goto_line"
 "ctrl+f" = "find"
+
+[theme]
+background = [30, 30, 46]
+foreground = [205, 214, 244]
+status_bg  = [49, 50, 68]
+status_fg  = [180, 190, 254]
 ```
 
 ### Supported Key Actions
