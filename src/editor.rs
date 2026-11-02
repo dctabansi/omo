@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     queue,
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -10,9 +10,39 @@ use crossterm::{
 };
 use std::io::{Write, stdout};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, char_display_width, sanitize_render_char, str_display_width};
 use crate::config::{Action, Config};
 use crate::terminal::Terminal;
+
+fn truncate_to_display_width(s: &str, max_cols: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut width = 0;
+    for c in s.chars() {
+        let safe = sanitize_render_char(c);
+        let w = char_display_width(safe);
+        if width + w > max_cols {
+            break;
+        }
+        out.push(safe);
+        width += w;
+    }
+    (out, width)
+}
+
+fn tail_to_display_width(s: &str, max_cols: usize) -> (String, usize) {
+    let chars: Vec<char> = s.chars().map(sanitize_render_char).collect();
+    let mut width = 0;
+    let mut start_idx = chars.len();
+    for (idx, &c) in chars.iter().enumerate().rev() {
+        let w = char_display_width(c);
+        if width + w > max_cols {
+            break;
+        }
+        width += w;
+        start_idx = idx;
+    }
+    (chars[start_idx..].iter().collect(), width)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptState {
@@ -24,6 +54,7 @@ pub enum PromptState {
         query: String,
         saved_cx: usize,
         saved_cy: usize,
+        case_sensitive: bool,
     },
 }
 
@@ -127,9 +158,28 @@ impl Editor {
     /// Computes the hardware cursor screen coordinates `(screen_cx, screen_cy)` using visual tab-expanded `rx`.
     pub fn cursor_screen_position(&self) -> (u16, u16) {
         let rx = self.visual_cx();
-        let screen_cx = (self.gutter_width() + rx.saturating_sub(self.col_offset)) as u16;
-        let screen_cy = self.cy.saturating_sub(self.row_offset) as u16;
+        let screen_cx = (self.gutter_width() + rx.saturating_sub(self.col_offset))
+            .min(u16::MAX as usize) as u16;
+        let screen_cy = self
+            .cy
+            .saturating_sub(self.row_offset)
+            .min(u16::MAX as usize) as u16;
         (screen_cx, screen_cy)
+    }
+
+    /// Computes the active hardware cursor screen coordinates, placing the cursor on the bottom
+    /// status bar when typing in the `SaveAs` prompt and clamping to terminal bounds.
+    pub fn active_cursor_screen_position(&self, cols: u16, rows: u16) -> (u16, u16) {
+        let max_col = cols.saturating_sub(1);
+        let max_row = rows.saturating_sub(1);
+        if let PromptState::SaveAs { input } = &self.prompt {
+            let prompt_prefix = format!(" Save as: {input}");
+            let width = str_display_width(&prompt_prefix).min(u16::MAX as usize) as u16;
+            return (width.min(max_col), max_row);
+        }
+        let (screen_cx, screen_cy) = self.cursor_screen_position();
+        let max_text_row = rows.saturating_sub(2);
+        (screen_cx.min(max_col), screen_cy.min(max_text_row))
     }
 
     /// Formats the status bar string padded to `cols` terminal columns.
@@ -140,8 +190,13 @@ impl Editor {
 
         let left = match &self.prompt {
             PromptState::SaveAs { input } => format!(" Save as: {input}"),
-            PromptState::Search { query, .. } => {
-                format!(" Search (Esc to cancel, arrows/Enter to jump): {query}")
+            PromptState::Search {
+                query,
+                case_sensitive,
+                ..
+            } => {
+                let mode = if *case_sensitive { "Aa" } else { "aa" };
+                format!(" Search [{mode}] (Alt+C case, arrows/Enter): {query}")
             }
             PromptState::None => {
                 let name = self.buffer.filename.as_deref().unwrap_or("[No Name]");
@@ -161,18 +216,30 @@ impl Editor {
             self.buffer.len()
         );
 
-        let left_len = left.chars().count();
-        let right_len = right.chars().count();
+        let (clean_left, left_len) = truncate_to_display_width(&left, usize::MAX);
+        let (clean_right, right_len) = truncate_to_display_width(&right, usize::MAX);
 
         if left_len + right_len <= cols {
             let padding = " ".repeat(cols - left_len - right_len);
-            format!("{left}{padding}{right}")
+            format!("{clean_left}{padding}{clean_right}")
+        } else if !matches!(self.prompt, PromptState::None) {
+            if left_len <= cols {
+                let padding = " ".repeat(cols - left_len);
+                format!("{clean_left}{padding}")
+            } else {
+                let (tail, tail_w) = tail_to_display_width(&clean_left, cols);
+                let padding = " ".repeat(cols - tail_w);
+                format!("{tail}{padding}")
+            }
         } else if right_len < cols {
             let keep_left = cols - right_len;
-            let truncated_left: String = left.chars().take(keep_left).collect();
-            format!("{truncated_left}{right}")
+            let (truncated_left, trunc_w) = truncate_to_display_width(&clean_left, keep_left);
+            let padding = " ".repeat(keep_left - trunc_w);
+            format!("{truncated_left}{padding}{clean_right}")
         } else {
-            right.chars().take(cols).collect()
+            let (truncated_right, trunc_w) = truncate_to_display_width(&clean_right, cols);
+            let padding = " ".repeat(cols - trunc_w);
+            format!("{truncated_right}{padding}")
         }
     }
 
@@ -197,30 +264,37 @@ impl Editor {
 
     /// Moves the cursor according to a navigation key and terminal viewport height.
     pub fn move_cursor(&mut self, code: KeyCode, viewport_rows: usize) {
+        self.buffer.break_undo_coalesce();
         match code {
             KeyCode::Up if self.cy > 0 => {
                 self.cy -= 1;
-                self.cx = self.desired_cx.min(self.current_row_len());
+                self.cx = self
+                    .buffer
+                    .get_row(self.cy)
+                    .map_or(0, |row| row.rx_to_cx(self.desired_cx));
             }
             KeyCode::Down if self.cy + 1 < self.buffer.len() => {
                 self.cy += 1;
-                self.cx = self.desired_cx.min(self.current_row_len());
+                self.cx = self
+                    .buffer
+                    .get_row(self.cy)
+                    .map_or(0, |row| row.rx_to_cx(self.desired_cx));
             }
             KeyCode::Left => {
                 if self.cx > 0 {
                     self.cx -= 1;
-                    self.desired_cx = self.cx;
+                    self.desired_cx = self.visual_cx();
                 } else if self.cy > 0 {
                     self.cy -= 1;
                     self.cx = self.current_row_len();
-                    self.desired_cx = self.cx;
+                    self.desired_cx = self.visual_cx();
                 }
             }
             KeyCode::Right => {
                 let row_len = self.current_row_len();
                 if self.cx < row_len {
                     self.cx += 1;
-                    self.desired_cx = self.cx;
+                    self.desired_cx = self.visual_cx();
                 } else if self.cy + 1 < self.buffer.len() {
                     self.cy += 1;
                     self.cx = 0;
@@ -233,17 +307,23 @@ impl Editor {
             }
             KeyCode::End => {
                 self.cx = self.current_row_len();
-                self.desired_cx = self.cx;
+                self.desired_cx = self.visual_cx();
             }
             KeyCode::PageUp => {
                 let step = viewport_rows.max(1);
                 self.cy = self.cy.saturating_sub(step);
-                self.cx = self.desired_cx.min(self.current_row_len());
+                self.cx = self
+                    .buffer
+                    .get_row(self.cy)
+                    .map_or(0, |row| row.rx_to_cx(self.desired_cx));
             }
             KeyCode::PageDown if !self.buffer.is_empty() => {
                 let step = viewport_rows.max(1);
                 self.cy = (self.cy + step).min(self.buffer.len() - 1);
-                self.cx = self.desired_cx.min(self.current_row_len());
+                self.cx = self
+                    .buffer
+                    .get_row(self.cy)
+                    .map_or(0, |row| row.rx_to_cx(self.desired_cx));
             }
             _ => {}
         }
@@ -253,7 +333,7 @@ impl Editor {
     pub fn insert_char(&mut self, c: char) {
         self.buffer.insert_char(self.cx, self.cy, c);
         self.cx += 1;
-        self.desired_cx = self.cx;
+        self.desired_cx = self.visual_cx();
     }
 
     /// Splits the current line at the cursor and moves to the start of the new line.
@@ -269,14 +349,14 @@ impl Editor {
         if let Some((new_cx, new_cy)) = self.buffer.delete_char(self.cx, self.cy) {
             self.cx = new_cx;
             self.cy = new_cy;
-            self.desired_cx = self.cx;
+            self.desired_cx = self.visual_cx();
         }
     }
 
     /// Deletes the character under the cursor or joins the next line.
     pub fn delete_forward(&mut self) {
         self.buffer.delete_forward(self.cx, self.cy);
-        self.desired_cx = self.cx;
+        self.desired_cx = self.visual_cx();
     }
 
     /// Saves the buffer or opens the inline Save-As prompt if the buffer is unnamed.
@@ -315,7 +395,7 @@ impl Editor {
         if let Some((cx, cy)) = self.buffer.undo(self.cx, self.cy) {
             self.cx = cx;
             self.cy = cy;
-            self.desired_cx = cx;
+            self.desired_cx = self.visual_cx();
             self.status_message = Some("Undo.".to_string());
         } else {
             self.status_message = Some("Already at oldest change.".to_string());
@@ -327,19 +407,20 @@ impl Editor {
         if let Some((cx, cy)) = self.buffer.redo(self.cx, self.cy) {
             self.cx = cx;
             self.cy = cy;
-            self.desired_cx = cx;
+            self.desired_cx = self.visual_cx();
             self.status_message = Some("Redo.".to_string());
         } else {
             self.status_message = Some("Already at newest change.".to_string());
         }
     }
 
-    /// Opens the interactive status-bar search prompt.
+    /// Opens the interactive status-bar search prompt (case-insensitive by default).
     pub fn trigger_find(&mut self) {
         self.prompt = PromptState::Search {
             query: String::new(),
             saved_cx: self.cx,
             saved_cy: self.cy,
+            case_sensitive: false,
         };
         self.status_message = None;
     }
@@ -377,6 +458,10 @@ impl Editor {
 
     /// Processes a single key event against the current editor state.
     pub fn handle_key_event(&mut self, key: KeyEvent, viewport_rows: usize) {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return;
+        }
+
         match self.prompt.clone() {
             PromptState::SaveAs { mut input } => {
                 match key.code {
@@ -422,50 +507,93 @@ impl Editor {
                 mut query,
                 saved_cx,
                 saved_cy,
+                mut case_sensitive,
             } => {
                 match key.code {
                     KeyCode::Esc => {
                         self.cx = saved_cx;
                         self.cy = saved_cy;
-                        self.desired_cx = saved_cx;
+                        self.desired_cx = self.visual_cx();
                         self.prompt = PromptState::None;
                         self.status_message = Some("Search canceled.".to_string());
                     }
-                    KeyCode::Enter | KeyCode::Down | KeyCode::Right => {
-                        if let Some((match_cx, match_cy)) =
-                            self.buffer.find(&query, self.cx + 1, self.cy, true)
-                        {
-                            self.cx = match_cx;
-                            self.cy = match_cy;
-                            self.desired_cx = match_cx;
-                        }
+                    KeyCode::Enter => {
+                        self.desired_cx = self.visual_cx();
+                        self.prompt = PromptState::None;
+                        self.status_message = None;
                     }
-                    KeyCode::Up | KeyCode::Left => {
-                        if let Some((match_cx, match_cy)) =
-                            self.buffer.find(&query, self.cx, self.cy, false)
-                        {
+                    KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        case_sensitive = !case_sensitive;
+                        if let Some((match_cx, match_cy)) = self.buffer.find_with_case(
+                            &query,
+                            saved_cx,
+                            saved_cy,
+                            true,
+                            case_sensitive,
+                        ) {
                             self.cx = match_cx;
                             self.cy = match_cy;
-                            self.desired_cx = match_cx;
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        query.pop();
-                        if let Some((match_cx, match_cy)) =
-                            self.buffer.find(&query, saved_cx, saved_cy, true)
-                        {
-                            self.cx = match_cx;
-                            self.cy = match_cy;
-                            self.desired_cx = match_cx;
+                            self.desired_cx = self.visual_cx();
                         } else {
                             self.cx = saved_cx;
                             self.cy = saved_cy;
-                            self.desired_cx = saved_cx;
+                            self.desired_cx = self.visual_cx();
                         }
                         self.prompt = PromptState::Search {
                             query,
                             saved_cx,
                             saved_cy,
+                            case_sensitive,
+                        };
+                    }
+                    KeyCode::Down | KeyCode::Right => {
+                        if let Some((match_cx, match_cy)) = self.buffer.find_with_case(
+                            &query,
+                            self.cx + 1,
+                            self.cy,
+                            true,
+                            case_sensitive,
+                        ) {
+                            self.cx = match_cx;
+                            self.cy = match_cy;
+                            self.desired_cx = self.visual_cx();
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Left => {
+                        if let Some((match_cx, match_cy)) = self.buffer.find_with_case(
+                            &query,
+                            self.cx,
+                            self.cy,
+                            false,
+                            case_sensitive,
+                        ) {
+                            self.cx = match_cx;
+                            self.cy = match_cy;
+                            self.desired_cx = self.visual_cx();
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        if let Some((match_cx, match_cy)) = self.buffer.find_with_case(
+                            &query,
+                            saved_cx,
+                            saved_cy,
+                            true,
+                            case_sensitive,
+                        ) {
+                            self.cx = match_cx;
+                            self.cy = match_cy;
+                            self.desired_cx = self.visual_cx();
+                        } else {
+                            self.cx = saved_cx;
+                            self.cy = saved_cy;
+                            self.desired_cx = self.visual_cx();
+                        }
+                        self.prompt = PromptState::Search {
+                            query,
+                            saved_cx,
+                            saved_cy,
+                            case_sensitive,
                         };
                     }
                     KeyCode::Char(c)
@@ -474,17 +602,26 @@ impl Editor {
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                     {
                         query.push(c);
-                        if let Some((match_cx, match_cy)) =
-                            self.buffer.find(&query, saved_cx, saved_cy, true)
-                        {
+                        if let Some((match_cx, match_cy)) = self.buffer.find_with_case(
+                            &query,
+                            saved_cx,
+                            saved_cy,
+                            true,
+                            case_sensitive,
+                        ) {
                             self.cx = match_cx;
                             self.cy = match_cy;
-                            self.desired_cx = match_cx;
+                            self.desired_cx = self.visual_cx();
+                        } else {
+                            self.cx = saved_cx;
+                            self.cy = saved_cy;
+                            self.desired_cx = self.visual_cx();
                         }
                         self.prompt = PromptState::Search {
                             query,
                             saved_cx,
                             saved_cy,
+                            case_sensitive,
                         };
                     }
                     _ => {}
@@ -496,12 +633,12 @@ impl Editor {
 
         let command = self.resolve_command(key);
 
-        if command == EditorCommand::Action(Action::Quit) {
-            self.trigger_quit();
-            return;
+        if command != EditorCommand::Action(Action::Quit) {
+            self.quit_confirm_pending = false;
+            if command != EditorCommand::Noop {
+                self.status_message = None;
+            }
         }
-
-        self.quit_confirm_pending = false;
 
         match command {
             EditorCommand::Action(Action::Quit) => self.trigger_quit(),
@@ -542,7 +679,7 @@ impl Editor {
         self.draw_rows(&mut stdout, cols, rows)?;
         self.draw_status_bar(&mut stdout, cols)?;
 
-        let (screen_cx, screen_cy) = self.cursor_screen_position();
+        let (screen_cx, screen_cy) = self.active_cursor_screen_position(cols, rows);
         queue!(stdout, cursor::MoveTo(screen_cx, screen_cy), cursor::Show)?;
 
         stdout.flush()?;
@@ -601,6 +738,7 @@ impl Editor {
         let has_custom_status_theme =
             self.config.theme.status_bg.is_some() || self.config.theme.status_fg.is_some();
 
+        self.apply_editor_theme(stdout)?;
         if has_custom_status_theme {
             if let Some((r, g, b)) = self.config.theme.status_bg {
                 queue!(stdout, SetBackgroundColor(Color::Rgb { r, g, b }))?;
@@ -734,9 +872,10 @@ mod tests {
         assert!(!editor.should_quit);
         assert!(editor.quit_confirm_pending);
 
-        // Any intervening key resets the quit confirmation state
+        // Any intervening key resets the quit confirmation state and clears the warning message
         editor.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 24);
         assert!(!editor.quit_confirm_pending);
+        assert_eq!(editor.status_message, None);
 
         editor.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL), 24);
         assert!(!editor.should_quit);
@@ -875,5 +1014,104 @@ mod tests {
         assert_eq!(editor.visual_cx(), 5);
         // Gutter width for 1 line is 3 (" 1 "), so screen_cx is 3 + 5 = 8
         assert_eq!(editor.cursor_screen_position(), (8, 0));
+    }
+
+    #[test]
+    fn find_prompt_enter_accepts_match_and_non_matching_char_resets_cursor() {
+        let mut editor = Editor::new(Buffer::from_lines(&[
+            "first target here",
+            "second target there",
+        ]));
+        editor.cx = 0;
+        editor.cy = 0;
+
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 24);
+        for ch in "target".chars() {
+            editor.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), 24);
+        }
+        assert_eq!((editor.cx, editor.cy), (6, 0));
+
+        // Typing a non-matching character resets cursor back to saved position (0, 0)
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), 24);
+        assert_eq!((editor.cx, editor.cy), (0, 0));
+
+        // Backspace restores the match for "target" at (6, 0)
+        editor.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), 24);
+        assert_eq!((editor.cx, editor.cy), (6, 0));
+
+        // Pressing Enter exits Search prompt while keeping cursor at the matched position
+        editor.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 24);
+        assert_eq!(editor.prompt, PromptState::None);
+        assert_eq!((editor.cx, editor.cy), (6, 0));
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let mut editor = Editor::new(Buffer::new());
+        let release_event = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        editor.handle_key_event(release_event, 24);
+        assert!(editor.buffer.is_empty());
+    }
+
+    #[test]
+    fn vertical_navigation_aligns_visual_columns_across_tabs_and_spaces() {
+        let buf = sample_buffer(&["\t\tfoo", "        bar"]);
+        let mut editor = Editor::new(buf);
+        // Move to 'f' on line 0: cx = 2, visual rx = 8
+        editor.move_cursor(KeyCode::Right, 24);
+        editor.move_cursor(KeyCode::Right, 24);
+        assert_eq!((editor.cx, editor.visual_cx()), (2, 8));
+
+        // Moving down to space-indented line lands on 'b' at cx = 8 (visual rx = 8)
+        editor.move_cursor(KeyCode::Down, 24);
+        assert_eq!((editor.cx, editor.visual_cx()), (8, 8));
+
+        // Moving back up returns to 'f' at cx = 2 (visual rx = 8)
+        editor.move_cursor(KeyCode::Up, 24);
+        assert_eq!((editor.cx, editor.visual_cx()), (2, 8));
+    }
+
+    #[test]
+    fn save_as_prompt_positions_cursor_on_status_bar() {
+        let mut editor = Editor::new(Buffer::new());
+        editor.trigger_save();
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), 24);
+        // " Save as: a" has display width 11, placed on bottom row (24 - 1 = 23)
+        assert_eq!(editor.active_cursor_screen_position(80, 24), (11, 23));
+    }
+
+    #[test]
+    fn status_bar_preserves_active_prompt_tail_on_narrow_terminals() {
+        let mut editor = Editor::new(Buffer::from_lines(&["hello"]));
+        editor.trigger_find();
+        for ch in "very_long_search_query_tail".chars() {
+            editor.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), 24);
+        }
+        let bar = editor.format_status_bar(40);
+        assert_eq!(bar.chars().count(), 40);
+        assert!(bar.ends_with("very_long_search_query_tail"));
+    }
+
+    #[test]
+    fn find_prompt_defaults_to_case_insensitive_and_alt_c_toggles_case_sensitivity() {
+        let mut editor = Editor::new(Buffer::from_lines(&["first TARGET here", "second target"]));
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 24);
+        for ch in "target".chars() {
+            editor.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), 24);
+        }
+        // Case-insensitive by default: matches "TARGET" on line 0 at cx = 6
+        assert_eq!((editor.cx, editor.cy), (6, 0));
+
+        // Pressing Alt+C enables case-sensitive mode, jumping to lowercase "target" on line 1 at cx = 7
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT), 24);
+        assert_eq!((editor.cx, editor.cy), (7, 1));
+
+        // Pressing Alt+C again returns to case-insensitive mode, matching line 0 at cx = 6
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT), 24);
+        assert_eq!((editor.cx, editor.cy), (6, 0));
     }
 }
