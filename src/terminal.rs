@@ -40,6 +40,32 @@ impl Terminal {
         let size = crossterm::terminal::size()?;
         Ok(size)
     }
+
+    /// Temporarily restores the terminal to normal cooked mode on the main screen to run an
+    /// interactive subprocess (such as `sudo -v`), then re-enters raw mode and the alternate screen.
+    pub fn with_suspended<F, R>(f: F) -> Result<R>
+    where
+        F: FnOnce() -> Result<R>,
+    {
+        let _ = execute!(
+            stdout(),
+            crossterm::style::Print("\x1b[>4;0m"),
+            PopKeyboardEnhancementFlags
+        );
+        let _ = execute!(stdout(), ResetColor, cursor::Show, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+
+        let result = f();
+
+        enable_raw_mode()?;
+        let _ = execute!(stdout(), EnterAlternateScreen, Clear(ClearType::All));
+        let _ = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            crossterm::style::Print("\x1b[>4;1m")
+        );
+        result
+    }
 }
 
 /// Restores the terminal to its normal state, guaranteeing cleanup even if the program panics.

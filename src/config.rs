@@ -12,9 +12,10 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# omo configuration file
 tab_width = 4
 expand_tabs = true
 auto_indent = true
+auto_pairs = true
 
 [filetypes]
-# Per-filetype tab_width and expand_tabs (true = spaces, false = literal '\t')
+# Per-filetype tab_width, expand_tabs (true = spaces, false = literal '\t'), and auto_pairs
 bash        = { tab_width = 4, expand_tabs = true }
 c           = { tab_width = 4, expand_tabs = true }
 cc          = { tab_width = 4, expand_tabs = true }
@@ -71,6 +72,8 @@ zsh         = { tab_width = 4, expand_tabs = true }
 "alt+d"            = "duplicate_line"
 "ctrl+shift+d"     = "delete_line"
 "alt+shift+d"      = "delete_line"
+"alt+up"           = "move_line_up"
+"alt+down"         = "move_line_down"
 "shift+enter"      = "insert_line_below"
 "ctrl+enter"       = "insert_line_below"
 "alt+enter"        = "insert_line_below"
@@ -131,6 +134,10 @@ fn default_auto_indent() -> bool {
     true
 }
 
+fn default_auto_pairs() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileTypeConfig {
@@ -142,6 +149,8 @@ pub struct FileTypeConfig {
     pub tab_width: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expand_tabs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pairs: Option<bool>,
 }
 
 fn serialize_sorted_map<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
@@ -151,6 +160,43 @@ where
 {
     let ordered: BTreeMap<&String, &V> = map.iter().collect();
     ordered.serialize(serializer)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawKeyBinding {
+    Single(String),
+    Multiple(Vec<Action>),
+}
+
+fn parse_action_name(name: &str) -> Result<Action, String> {
+    let quoted = format!("\"{}\"", name.trim());
+    toml::from_str::<Action>(&format!("action = {quoted}"))
+        .or_else(|_| {
+            #[derive(Deserialize)]
+            struct Wrapper {
+                action: Action,
+            }
+            toml::from_str::<Wrapper>(&format!("action = {quoted}")).map(|w| w.action)
+        })
+        .map_err(|_| format!("unknown action '{}'", name.trim()))
+}
+
+fn serialize_keys<S>(map: &HashMap<String, Vec<Action>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let ordered: BTreeMap<&String, &Vec<Action>> = map.iter().collect();
+    let mut ser_map = serializer.serialize_map(Some(ordered.len()))?;
+    for (k, actions) in ordered {
+        if actions.len() == 1 {
+            ser_map.serialize_entry(k, &actions[0])?;
+        } else {
+            ser_map.serialize_entry(k, actions)?;
+        }
+    }
+    ser_map.end()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +211,8 @@ pub struct Config {
     pub expand_tabs: bool,
     #[serde(default = "default_auto_indent")]
     pub auto_indent: bool,
+    #[serde(default = "default_auto_pairs")]
+    pub auto_pairs: bool,
     #[serde(
         default = "default_filetypes",
         deserialize_with = "deserialize_filetypes",
@@ -174,9 +222,9 @@ pub struct Config {
     #[serde(
         default = "default_keys",
         deserialize_with = "deserialize_keys",
-        serialize_with = "serialize_sorted_map"
+        serialize_with = "serialize_keys"
     )]
-    pub keys: HashMap<String, Action>,
+    pub keys: HashMap<String, Vec<Action>>,
     pub theme: ThemeConfig,
 }
 
@@ -203,6 +251,8 @@ pub enum Action {
     Find,
     DuplicateLine,
     DeleteLine,
+    MoveLineUp,
+    MoveLineDown,
     InsertLineBelow,
     InsertLineAbove,
     Unindent,
@@ -218,6 +268,7 @@ pub fn default_filetypes() -> HashMap<String, FileTypeConfig> {
     let two_space = FileTypeConfig {
         tab_width: Some(2),
         expand_tabs: Some(true),
+        auto_pairs: None,
     };
     for ext in [
         "yaml", "yml", "json", "jsonc", "toml", "html", "htm", "xml", "svg", "css", "scss", "js",
@@ -229,6 +280,7 @@ pub fn default_filetypes() -> HashMap<String, FileTypeConfig> {
     let four_space = FileTypeConfig {
         tab_width: Some(4),
         expand_tabs: Some(true),
+        auto_pairs: None,
     };
     for ext in [
         "rs", "py", "java", "kt", "kts", "c", "h", "cpp", "hpp", "cc", "sh", "bash", "zsh",
@@ -240,6 +292,7 @@ pub fn default_filetypes() -> HashMap<String, FileTypeConfig> {
     let hard_tab = FileTypeConfig {
         tab_width: Some(4),
         expand_tabs: Some(false),
+        auto_pairs: None,
     };
     for ext in ["makefile", "gnumakefile", "mk", "go"] {
         map.insert(ext.to_string(), hard_tab);
@@ -249,7 +302,16 @@ pub fn default_filetypes() -> HashMap<String, FileTypeConfig> {
 }
 
 fn normalize_filetype_key(raw: &str) -> String {
-    raw.trim().trim_start_matches('.').to_ascii_lowercase()
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if let Some(rest) = trimmed.strip_prefix('.')
+        && !rest.is_empty()
+        && !rest.contains('.')
+        && !rest.contains('*')
+        && !rest.contains('?')
+    {
+        return rest.to_string();
+    }
+    trimmed
 }
 
 fn deserialize_filetypes<'de, D>(
@@ -272,49 +334,57 @@ where
         if v.expand_tabs.is_some() {
             entry.expand_tabs = v.expand_tabs;
         }
+        if v.auto_pairs.is_some() {
+            entry.auto_pairs = v.auto_pairs;
+        }
     }
     Ok(merged)
 }
 
-pub fn default_keys() -> HashMap<String, Action> {
+pub fn default_keys() -> HashMap<String, Vec<Action>> {
     let mut keys = HashMap::new();
-    keys.insert("ctrl+q".to_string(), Action::Quit);
-    keys.insert("alt+q".to_string(), Action::Quit);
-    keys.insert("ctrl+s".to_string(), Action::Save);
-    keys.insert("alt+s".to_string(), Action::Save);
-    keys.insert("f2".to_string(), Action::Save);
-    keys.insert("ctrl+z".to_string(), Action::Undo);
-    keys.insert("alt+z".to_string(), Action::Undo);
-    keys.insert("ctrl+y".to_string(), Action::Redo);
-    keys.insert("alt+y".to_string(), Action::Redo);
-    keys.insert("ctrl+shift+z".to_string(), Action::Redo);
-    keys.insert("ctrl+f".to_string(), Action::Find);
-    keys.insert("alt+f".to_string(), Action::Find);
-    keys.insert("f3".to_string(), Action::Find);
-    keys.insert("ctrl+d".to_string(), Action::DuplicateLine);
-    keys.insert("alt+d".to_string(), Action::DuplicateLine);
-    keys.insert("ctrl+shift+d".to_string(), Action::DeleteLine);
-    keys.insert("alt+shift+d".to_string(), Action::DeleteLine);
-    keys.insert("shift+enter".to_string(), Action::InsertLineBelow);
-    keys.insert("ctrl+enter".to_string(), Action::InsertLineBelow);
-    keys.insert("alt+enter".to_string(), Action::InsertLineBelow);
-    keys.insert("ctrl+j".to_string(), Action::InsertLineBelow);
-    keys.insert("ctrl+shift+enter".to_string(), Action::InsertLineAbove);
-    keys.insert("ctrl+alt+enter".to_string(), Action::InsertLineAbove);
-    keys.insert("alt+shift+enter".to_string(), Action::InsertLineAbove);
-    keys.insert("shift+tab".to_string(), Action::Unindent);
-    keys.insert("ctrl+left".to_string(), Action::WordLeft);
-    keys.insert("alt+left".to_string(), Action::WordLeft);
-    keys.insert("ctrl+right".to_string(), Action::WordRight);
-    keys.insert("alt+right".to_string(), Action::WordRight);
-    keys.insert("ctrl+backspace".to_string(), Action::DeleteWordLeft);
-    keys.insert("alt+backspace".to_string(), Action::DeleteWordLeft);
-    keys.insert("ctrl+w".to_string(), Action::DeleteWordLeft);
-    keys.insert("ctrl+h".to_string(), Action::DeleteWordLeft);
-    keys.insert("ctrl+delete".to_string(), Action::DeleteWordRight);
-    keys.insert("alt+delete".to_string(), Action::DeleteWordRight);
-    keys.insert("ctrl+g".to_string(), Action::GotoLine);
-    keys.insert("alt+g".to_string(), Action::GotoLine);
+    let mut bind = |k: &str, a: Action| {
+        keys.insert(k.to_string(), vec![a]);
+    };
+    bind("ctrl+q", Action::Quit);
+    bind("alt+q", Action::Quit);
+    bind("ctrl+s", Action::Save);
+    bind("alt+s", Action::Save);
+    bind("f2", Action::Save);
+    bind("ctrl+z", Action::Undo);
+    bind("alt+z", Action::Undo);
+    bind("ctrl+y", Action::Redo);
+    bind("alt+y", Action::Redo);
+    bind("ctrl+shift+z", Action::Redo);
+    bind("ctrl+f", Action::Find);
+    bind("alt+f", Action::Find);
+    bind("f3", Action::Find);
+    bind("ctrl+d", Action::DuplicateLine);
+    bind("alt+d", Action::DuplicateLine);
+    bind("ctrl+shift+d", Action::DeleteLine);
+    bind("alt+shift+d", Action::DeleteLine);
+    bind("alt+up", Action::MoveLineUp);
+    bind("alt+down", Action::MoveLineDown);
+    bind("shift+enter", Action::InsertLineBelow);
+    bind("ctrl+enter", Action::InsertLineBelow);
+    bind("alt+enter", Action::InsertLineBelow);
+    bind("ctrl+j", Action::InsertLineBelow);
+    bind("ctrl+shift+enter", Action::InsertLineAbove);
+    bind("ctrl+alt+enter", Action::InsertLineAbove);
+    bind("alt+shift+enter", Action::InsertLineAbove);
+    bind("shift+tab", Action::Unindent);
+    bind("ctrl+left", Action::WordLeft);
+    bind("alt+left", Action::WordLeft);
+    bind("ctrl+right", Action::WordRight);
+    bind("alt+right", Action::WordRight);
+    bind("ctrl+backspace", Action::DeleteWordLeft);
+    bind("alt+backspace", Action::DeleteWordLeft);
+    bind("ctrl+w", Action::DeleteWordLeft);
+    bind("ctrl+h", Action::DeleteWordLeft);
+    bind("ctrl+delete", Action::DeleteWordRight);
+    bind("alt+delete", Action::DeleteWordRight);
+    bind("ctrl+g", Action::GotoLine);
+    bind("alt+g", Action::GotoLine);
     keys
 }
 
@@ -353,16 +423,71 @@ fn normalize_key_descriptor(raw: &str) -> String {
     parts.join("+")
 }
 
-fn deserialize_keys<'de, D>(deserializer: D) -> Result<HashMap<String, Action>, D::Error>
+fn deserialize_keys<'de, D>(deserializer: D) -> Result<HashMap<String, Vec<Action>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw: HashMap<String, Action> = HashMap::deserialize(deserializer)?;
+    let raw: HashMap<String, RawKeyBinding> = HashMap::deserialize(deserializer)?;
     let mut merged = default_keys();
-    for (k, v) in raw {
-        merged.insert(normalize_key_descriptor(&k), v);
+    for (k, binding) in raw {
+        let actions = match binding {
+            RawKeyBinding::Single(s) => {
+                let mut list = Vec::new();
+                for part in s.split(',') {
+                    let action = parse_action_name(part).map_err(serde::de::Error::custom)?;
+                    list.push(action);
+                }
+                if list.is_empty() {
+                    return Err(serde::de::Error::custom(format!(
+                        "keybinding for '{k}' must contain at least one action"
+                    )));
+                }
+                list
+            }
+            RawKeyBinding::Multiple(list) => {
+                if list.is_empty() {
+                    return Err(serde::de::Error::custom(format!(
+                        "keybinding array for '{k}' cannot be empty"
+                    )));
+                }
+                list
+            }
+        };
+        merged.insert(normalize_key_descriptor(&k), actions);
     }
     Ok(merged)
+}
+
+/// Matches a glob pattern supporting `*` (zero or more characters) and `?` (any single character).
+pub fn matches_glob(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_idx = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(star) = star_idx {
+            pi = star + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+
+    pi == p.len()
 }
 
 impl Default for Config {
@@ -371,6 +496,7 @@ impl Default for Config {
             tab_width: DEFAULT_TAB_WIDTH,
             expand_tabs: true,
             auto_indent: true,
+            auto_pairs: true,
             theme: ThemeConfig::default(),
             filetypes: default_filetypes(),
             keys: default_keys(),
@@ -397,32 +523,92 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("config.toml"))
     }
 
-    /// Resolves `(tab_width, expand_tabs)` for the given `filename`, checking `[filetypes]`
-    /// by file extension and basename before falling back to top-level `tab_width` and `expand_tabs`.
-    pub fn resolve_filetype_settings(&self, filename: Option<&str>) -> (usize, bool) {
+    /// Resolves `(tab_width, expand_tabs, auto_pairs)` for the given `filename` using strict
+    /// precedence:
+    /// 1. Exact basename match (e.g., `tmux.conf`, `Cargo.lock`, `Makefile`)
+    /// 2. Glob pattern match (`*` / `?`, e.g., `*.conf`, `.env*`, `*.env.*`)
+    /// 3. File extension match (e.g., `rs`, `toml`, `py`)
+    /// 4. Global fallback (`tab_width`, `expand_tabs`, `auto_pairs`)
+    pub fn resolve_filetype_config(&self, filename: Option<&str>) -> (usize, bool, bool) {
         if let Some(name) = filename {
             let path = Path::new(name);
+            let full_lower = name.replace('\\', "/").to_ascii_lowercase();
+            let base_lower = path
+                .file_name()
+                .and_then(|b| b.to_str())
+                .map(|s| s.to_ascii_lowercase());
             let ext_key = path
                 .extension()
                 .and_then(|e| e.to_str())
                 .map(normalize_filetype_key);
-            let base_key = path
-                .file_name()
-                .and_then(|b| b.to_str())
-                .map(normalize_filetype_key);
 
-            let matched = ext_key
-                .as_deref()
-                .and_then(|k| self.filetypes.get(k))
-                .or_else(|| base_key.as_deref().and_then(|k| self.filetypes.get(k)));
+            // 1. Exact basename match (checked before globs and extensions so dotted filenames like
+            // `tmux.conf` or `Cargo.lock` are never shadowed by `.conf` or `.lock` extension rules)
+            let exact_match = base_lower.as_deref().and_then(|base| {
+                self.filetypes.get(base).or_else(|| {
+                    let stripped = base.trim_start_matches('.');
+                    if !stripped.is_empty() && !stripped.contains('.') {
+                        self.filetypes.get(stripped)
+                    } else {
+                        None
+                    }
+                })
+            });
 
-            if let Some(ft) = matched {
+            // 2. Glob pattern match (keys containing `*` or `?`, ordered most-specific first)
+            let glob_match = if exact_match.is_none() {
+                let mut glob_entries: Vec<(&String, &FileTypeConfig)> = self
+                    .filetypes
+                    .iter()
+                    .filter(|(k, _)| k.contains('*') || k.contains('?'))
+                    .collect();
+                glob_entries.sort_by(|(a, _), (b, _)| {
+                    let a_lit = a.chars().filter(|&c| c != '*' && c != '?').count();
+                    let b_lit = b.chars().filter(|&c| c != '*' && c != '?').count();
+                    b_lit
+                        .cmp(&a_lit)
+                        .then_with(|| b.len().cmp(&a.len()))
+                        .then_with(|| a.cmp(b))
+                });
+                glob_entries
+                    .into_iter()
+                    .find(|(pattern, _)| {
+                        base_lower
+                            .as_deref()
+                            .is_some_and(|base| matches_glob(pattern, base))
+                            || matches_glob(pattern, &full_lower)
+                    })
+                    .map(|(_, cfg)| cfg)
+            } else {
+                None
+            };
+
+            // 3. Extension match
+            let ext_match = if exact_match.is_none() && glob_match.is_none() {
+                ext_key.as_deref().and_then(|k| self.filetypes.get(k))
+            } else {
+                None
+            };
+
+            if let Some(ft) = exact_match.or(glob_match).or(ext_match) {
                 let tw = ft.tab_width.unwrap_or(self.tab_width).max(1);
                 let expand = ft.expand_tabs.unwrap_or(self.expand_tabs);
-                return (tw, expand);
+                let pairs = ft.auto_pairs.unwrap_or(self.auto_pairs);
+                return (tw, expand, pairs);
             }
         }
-        (self.tab_width.max(1), self.expand_tabs)
+        (self.tab_width.max(1), self.expand_tabs, self.auto_pairs)
+    }
+
+    /// Resolves `(tab_width, expand_tabs)` for the given `filename`.
+    pub fn resolve_filetype_settings(&self, filename: Option<&str>) -> (usize, bool) {
+        let (tw, expand, _) = self.resolve_filetype_config(filename);
+        (tw, expand)
+    }
+
+    /// Resolves whether `auto_pairs` is enabled for the given `filename`.
+    pub fn resolve_auto_pairs(&self, filename: Option<&str>) -> bool {
+        self.resolve_filetype_config(filename).2
     }
 
     /// Resolves candidate configuration file paths across Unix and Windows environments
@@ -523,11 +709,218 @@ impl Config {
         (Self::default(), first_warning)
     }
 
-    /// Resolves a `KeyEvent` into a configured `Action`, if bound.
-    pub fn action_for_key(&self, key: KeyEvent) -> Option<Action> {
+    /// Resolves a `KeyEvent` into a configured slice of `Action`s, if bound.
+    pub fn actions_for_key(&self, key: KeyEvent) -> Option<&[Action]> {
         let descriptor = format_key_event(key)?;
-        self.keys.get(&descriptor).copied()
+        self.keys.get(&descriptor).map(Vec::as_slice)
     }
+
+    /// Resolves a `KeyEvent` into the first configured `Action`, if bound.
+    pub fn action_for_key(&self, key: KeyEvent) -> Option<Action> {
+        self.actions_for_key(key)
+            .and_then(|actions| actions.first().copied())
+    }
+}
+
+fn split_toml_key_value_and_comment(line: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+        return None;
+    }
+
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let mut eq_byte_idx = None;
+
+    for (idx, c) in line.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_double && c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if c == '=' && !in_single && !in_double {
+            eq_byte_idx = Some(idx);
+            break;
+        } else if c == '#' && !in_single && !in_double {
+            break;
+        }
+    }
+
+    let eq_idx = eq_byte_idx?;
+    let key_part = &line[..eq_idx];
+    let after_eq = &line[eq_idx + 1..];
+
+    in_single = false;
+    in_double = false;
+    escape = false;
+    let mut comment_idx = None;
+    for (idx, c) in after_eq.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_double && c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if c == '#' && !in_single && !in_double {
+            comment_idx = Some(idx);
+            break;
+        }
+    }
+
+    let (val_part, comment_part) = match comment_idx {
+        Some(c_idx) => (&after_eq[..c_idx], &after_eq[c_idx..]),
+        None => (after_eq, ""),
+    };
+    Some((key_part, val_part, comment_part))
+}
+
+fn unquote_toml_key(raw_key: &str) -> String {
+    let trimmed = raw_key.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn format_toml_key_for_insert(key: &str) -> String {
+    if key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        key.to_string()
+    } else {
+        format!("\"{key}\"")
+    }
+}
+
+/// Updates one or more `(key_path, raw_toml_value)` entries inside `existing_toml` in-place
+/// while preserving all `#` comments, blank lines, and section ordering.
+///
+/// `key_path` may be a top-level key (e.g., `"tab_width"`) or a sectioned key
+/// (`"filetypes.rs"`, `"keys.ctrl+q"`, `"theme.background"`).
+#[allow(dead_code)]
+pub fn update_toml_preserving_format(existing_toml: &str, updates: &[(&str, &str)]) -> String {
+    let has_crlf = existing_toml.contains("\r\n");
+    let line_ending = if has_crlf { "\r\n" } else { "\n" };
+    let ends_with_newline = existing_toml.ends_with('\n');
+
+    let mut lines: Vec<String> = existing_toml
+        .lines()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+        .collect();
+
+    for &(key_path, new_val) in updates {
+        let (target_section, target_key) = match key_path.split_once('.') {
+            Some((sec, rest))
+                if matches!(sec.trim(), "filetypes" | "keys" | "theme") && !rest.is_empty() =>
+            {
+                (Some(sec.trim()), unquote_toml_key(rest))
+            }
+            _ => (None, unquote_toml_key(key_path)),
+        };
+
+        let normalized_target = match target_section {
+            Some("keys") => normalize_key_descriptor(&target_key),
+            Some("filetypes") => normalize_filetype_key(&target_key),
+            _ => target_key.to_ascii_lowercase(),
+        };
+
+        let mut current_section: Option<String> = None;
+        let mut updated = false;
+        let mut section_found = target_section.is_none();
+        let mut last_key_line_in_section: Option<usize> = None;
+        let mut section_header_line: Option<usize> = None;
+
+        for (idx, line) in lines.iter_mut().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
+                let sec_name = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
+                current_section = Some(sec_name.clone());
+                if target_section == Some(sec_name.as_str()) {
+                    section_found = true;
+                    section_header_line = Some(idx);
+                }
+                continue;
+            }
+
+            let in_target_section = match (&current_section, target_section) {
+                (None, None) => true,
+                (Some(cur), Some(target)) => cur == target,
+                _ => false,
+            };
+
+            if !in_target_section {
+                continue;
+            }
+
+            if let Some((key_part, val_part, comment_part)) = split_toml_key_value_and_comment(line)
+            {
+                last_key_line_in_section = Some(idx);
+                let raw_k = unquote_toml_key(key_part);
+                let norm_k = match target_section {
+                    Some("keys") => normalize_key_descriptor(&raw_k),
+                    Some("filetypes") => normalize_filetype_key(&raw_k),
+                    _ => raw_k.to_ascii_lowercase(),
+                };
+                if norm_k == normalized_target {
+                    let leading_ws: String =
+                        val_part.chars().take_while(|c| c.is_whitespace()).collect();
+                    let ws_before_val = if leading_ws.is_empty() {
+                        " "
+                    } else {
+                        leading_ws.as_str()
+                    };
+                    if comment_part.is_empty() {
+                        *line = format!("{key_part}={ws_before_val}{new_val}");
+                    } else {
+                        *line = format!("{key_part}={ws_before_val}{new_val} {comment_part}");
+                    }
+                    updated = true;
+                    break;
+                }
+            }
+        }
+
+        if !updated {
+            let formatted_key = format_toml_key_for_insert(&target_key);
+            let new_line = format!("{formatted_key} = {new_val}");
+            if section_found {
+                let insert_idx = last_key_line_in_section
+                    .or(section_header_line)
+                    .map_or(lines.len(), |i| i + 1);
+                lines.insert(insert_idx, new_line);
+            } else if let Some(sec) = target_section {
+                if !lines.is_empty() && !lines.last().unwrap().trim().is_empty() {
+                    lines.push(String::new());
+                }
+                lines.push(format!("[{sec}]"));
+                lines.push(new_line);
+            }
+        }
+    }
+
+    let mut out = lines.join(line_ending);
+    if ends_with_newline {
+        out.push_str(line_ending);
+    }
+    out
 }
 
 /// Normalizes a `crossterm::event::KeyEvent` into a canonical lowercase key descriptor
@@ -832,6 +1225,87 @@ custom = { tab_width = 8, expand_tabs = false }
             PathBuf::from(r"C:\Users\Alice\AppData\Roaming")
                 .join("omo")
                 .join("config.toml")
+        );
+    }
+
+    #[test]
+    fn action_chaining_deserializes_arrays_and_comma_separated_strings() {
+        let toml_input = r#"
+[keys]
+"ctrl+shift+q" = ["save", "quit"]
+"alt+x" = "save, quit"
+"ctrl+s" = "save"
+"#;
+        let cfg = Config::from_toml_str(toml_input).unwrap();
+        let ctrl_shift_q = KeyEvent::new(
+            KeyCode::Char('Q'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            cfg.actions_for_key(ctrl_shift_q),
+            Some(&[Action::Save, Action::Quit][..])
+        );
+        assert_eq!(cfg.action_for_key(ctrl_shift_q), Some(Action::Save));
+
+        let alt_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(
+            cfg.actions_for_key(alt_x),
+            Some(&[Action::Save, Action::Quit][..])
+        );
+    }
+
+    #[test]
+    fn filetype_precedence_prioritizes_exact_filename_then_glob_then_extension() {
+        let toml_input = r#"
+tab_width = 4
+expand_tabs = true
+auto_pairs = true
+
+[filetypes]
+"tmux.conf" = { tab_width = 2, expand_tabs = true, auto_pairs = false }
+"*.conf"    = { tab_width = 4, expand_tabs = false }
+"conf"      = { tab_width = 8, expand_tabs = true }
+".env*"     = { tab_width = 2, expand_tabs = true, auto_pairs = false }
+"#;
+        let cfg = Config::from_toml_str(toml_input).unwrap();
+
+        // 1. Exact basename "tmux.conf" wins over "*.conf" and extension "conf"
+        assert_eq!(
+            cfg.resolve_filetype_config(Some("/etc/tmux.conf")),
+            (2, true, false)
+        );
+        // 2. Glob "*.conf" wins over extension "conf"
+        assert_eq!(
+            cfg.resolve_filetype_config(Some("/etc/nginx.conf")),
+            (4, false, true)
+        );
+        // 3. Glob ".env*" matches hidden files like ".env.local"
+        assert_eq!(
+            cfg.resolve_filetype_config(Some("/app/.env.local")),
+            (2, true, false)
+        );
+    }
+
+    #[test]
+    fn update_toml_preserving_format_retains_comments_and_updates_keys() {
+        let updated = update_toml_preserving_format(
+            DEFAULT_CONFIG_TEMPLATE,
+            &[
+                ("tab_width", "2"),
+                ("auto_pairs", "false"),
+                ("keys.\"ctrl+q\"", "[\"save\", \"quit\"]"),
+            ],
+        );
+        assert!(updated.contains("# omo configuration file"));
+        assert!(updated.contains("# Global fallback settings"));
+        assert!(updated.contains("# Optional 24-bit RGB colors: [R, G, B]"));
+
+        let parsed = Config::from_toml_str(&updated).unwrap();
+        assert_eq!(parsed.tab_width, 2);
+        assert!(!parsed.auto_pairs);
+        assert_eq!(
+            parsed.actions_for_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Some(&[Action::Save, Action::Quit][..])
         );
     }
 }
