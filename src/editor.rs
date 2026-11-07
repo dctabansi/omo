@@ -50,6 +50,9 @@ pub enum PromptState {
     SaveAs {
         input: String,
     },
+    ConfirmSudoSave {
+        path: String,
+    },
     Search {
         query: String,
         saved_cx: usize,
@@ -59,6 +62,29 @@ pub enum PromptState {
     GotoLine {
         input: String,
     },
+}
+
+fn matching_closing_delimiter(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '{' => Some('}'),
+        '[' => Some(']'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+fn is_closing_delimiter(c: char) -> bool {
+    matches!(c, ')' | '}' | ']' | '"' | '\'' | '`')
+}
+
+fn is_matching_empty_pair(left: char, right: char) -> bool {
+    matches!(
+        (left, right),
+        ('(', ')') | ('{', '}') | ('[', ']') | ('"', '"') | ('\'', '\'') | ('`', '`')
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +123,14 @@ impl Editor {
     pub fn with_config(mut buffer: Buffer, config: Config) -> Self {
         let (tab_width, _) = config.resolve_filetype_settings(buffer.filename.as_deref());
         buffer.set_tab_width(tab_width);
+        let status_message = if buffer.read_only {
+            let name = buffer.filename.as_deref().unwrap_or("[No Name]");
+            Some(format!(
+                "WARNING: '{name}' is read-only (saving will require sudo)."
+            ))
+        } else {
+            None
+        };
         Self {
             should_quit: false,
             buffer,
@@ -108,7 +142,7 @@ impl Editor {
             row_offset: 0,
             col_offset: 0,
             quit_confirm_pending: false,
-            status_message: None,
+            status_message,
             prompt: PromptState::None,
         }
     }
@@ -172,7 +206,7 @@ impl Editor {
     }
 
     /// Computes the active hardware cursor screen coordinates, placing the cursor on the bottom
-    /// status bar when typing in the `SaveAs` or `GotoLine` prompt and clamping to terminal bounds.
+    /// status bar when typing in the `SaveAs`, `ConfirmSudoSave`, or `GotoLine` prompt and clamping to terminal bounds.
     pub fn active_cursor_screen_position(&self, cols: u16, rows: u16) -> (u16, u16) {
         let max_col = cols.saturating_sub(1);
         let max_row = rows.saturating_sub(1);
@@ -180,6 +214,11 @@ impl Editor {
             PromptState::SaveAs { input } => {
                 let prompt_prefix = format!(" Save as: {input}");
                 let width = str_display_width(&prompt_prefix).min(u16::MAX as usize) as u16;
+                return (width.min(max_col), max_row);
+            }
+            PromptState::ConfirmSudoSave { .. } => {
+                let prompt_prefix = " Permission denied. Save with sudo? (y/n): ";
+                let width = str_display_width(prompt_prefix).min(u16::MAX as usize) as u16;
                 return (width.min(max_col), max_row);
             }
             PromptState::GotoLine { input } => {
@@ -202,6 +241,9 @@ impl Editor {
 
         let left = match &self.prompt {
             PromptState::SaveAs { input } => format!(" Save as: {input}"),
+            PromptState::ConfirmSudoSave { .. } => {
+                " Permission denied. Save with sudo? (y/n): ".to_string()
+            }
             PromptState::Search {
                 query,
                 case_sensitive,
@@ -351,7 +393,49 @@ impl Editor {
     }
 
     /// Inserts a single character at the cursor position and advances `cx`.
+    /// When `auto_pairs` is enabled for the active buffer, handles closing-delimiter skip-over
+    /// and auto-inserts matching closing brackets/quotes with context awareness.
     pub fn insert_char(&mut self, c: char) {
+        let auto_pairs = self
+            .config
+            .resolve_auto_pairs(self.buffer.filename.as_deref());
+        if auto_pairs && c != '\t' {
+            let next_ch = self
+                .buffer
+                .get_row(self.cy)
+                .and_then(|r| r.char_at(self.cx));
+            let prev_ch = if self.cx > 0 {
+                self.buffer
+                    .get_row(self.cy)
+                    .and_then(|r| r.char_at(self.cx - 1))
+            } else {
+                None
+            };
+
+            // Closing delimiter skip-over (overtype) when the exact closing delimiter is already under cursor
+            if is_closing_delimiter(c) && next_ch == Some(c) {
+                self.buffer.break_undo_coalesce();
+                self.cx += 1;
+                self.desired_cx = self.visual_cx();
+                return;
+            }
+
+            if let Some(close_ch) = matching_closing_delimiter(c) {
+                let suppress_for_quote_after_word = matches!(c, '\'' | '`')
+                    && prev_ch.is_some_and(|p| p.is_alphanumeric() || p == '_');
+                let suppress_before_word = next_ch.is_some_and(|n| n.is_alphanumeric() || n == '_');
+
+                if !suppress_for_quote_after_word && !suppress_before_word {
+                    self.buffer.insert_char(self.cx, self.cy, c);
+                    self.buffer
+                        .insert_char_no_snapshot(self.cx + 1, self.cy, close_ch);
+                    self.cx += 1;
+                    self.desired_cx = self.visual_cx();
+                    return;
+                }
+            }
+        }
+
         self.buffer.insert_char(self.cx, self.cy, c);
         self.cx += 1;
         self.desired_cx = self.visual_cx();
@@ -390,7 +474,27 @@ impl Editor {
     }
 
     /// Deletes the character to the left of the cursor or joins with the previous line.
+    /// When `auto_pairs` is enabled and the cursor sits inside an empty delimiter pair `(|)`,
+    /// deletes both delimiters in a single undo step.
     pub fn backspace(&mut self) {
+        if self
+            .config
+            .resolve_auto_pairs(self.buffer.filename.as_deref())
+            && self.cx > 0
+            && let Some(row) = self.buffer.get_row(self.cy)
+            && let (Some(left), Some(right)) = (row.char_at(self.cx - 1), row.char_at(self.cx))
+            && is_matching_empty_pair(left, right)
+        {
+            self.buffer.record_snapshot(self.cx, self.cy);
+            self.buffer.delete_forward_no_snapshot(self.cx, self.cy);
+            if let Some((new_cx, new_cy)) = self.buffer.delete_char_no_snapshot(self.cx, self.cy) {
+                self.cx = new_cx;
+                self.cy = new_cy;
+                self.desired_cx = self.visual_cx();
+            }
+            return;
+        }
+
         if let Some((new_cx, new_cy)) = self.buffer.delete_char(self.cx, self.cy) {
             self.cx = new_cx;
             self.cy = new_cy;
@@ -404,23 +508,45 @@ impl Editor {
         self.desired_cx = self.visual_cx();
     }
 
-    /// Saves the buffer or opens the inline Save-As prompt if the buffer is unnamed.
-    pub fn trigger_save(&mut self) {
-        if self.buffer.filename.is_some() {
-            match self.buffer.save() {
-                Ok(bytes) => {
-                    let name = self.buffer.filename.as_deref().unwrap_or("[No Name]");
-                    self.status_message = Some(format!("Wrote {bytes} bytes to {name}"));
-                }
-                Err(err) => {
+    fn handle_save_result(&mut self, path: &str, result: Result<usize>) -> bool {
+        match result {
+            Ok(bytes) => {
+                let (tab_width, _) = self
+                    .config
+                    .resolve_filetype_settings(self.buffer.filename.as_deref());
+                self.buffer.set_tab_width(tab_width);
+                self.status_message = Some(format!("Wrote {bytes} bytes to {path}"));
+                true
+            }
+            Err(err) => {
+                let is_perm_denied = err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+                if is_perm_denied {
+                    self.prompt = PromptState::ConfirmSudoSave {
+                        path: path.to_string(),
+                    };
+                    self.status_message = None;
+                } else {
                     self.status_message = Some(format!("Save error: {err}"));
                 }
+                false
             }
+        }
+    }
+
+    /// Saves the buffer or opens the inline Save-As prompt if the buffer is unnamed.
+    /// Returns `true` if the buffer was saved immediately without error or prompt.
+    pub fn trigger_save(&mut self) -> bool {
+        if let Some(name) = self.buffer.filename.clone() {
+            let res = self.buffer.save();
+            self.handle_save_result(&name, res)
         } else {
             self.prompt = PromptState::SaveAs {
                 input: String::new(),
             };
             self.status_message = None;
+            false
         }
     }
 
@@ -476,6 +602,24 @@ impl Editor {
                 .buffer
                 .get_row(self.cy)
                 .map_or(0, |row| row.rx_to_cx(self.desired_cx));
+        }
+    }
+
+    /// Moves the current line up by one row (`Alt+Up`).
+    pub fn trigger_move_line_up(&mut self) {
+        if let Some((new_cx, new_cy)) = self.buffer.move_line_up(self.cx, self.cy) {
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
+        }
+    }
+
+    /// Moves the current line down by one row (`Alt+Down`).
+    pub fn trigger_move_line_down(&mut self) {
+        if let Some((new_cx, new_cy)) = self.buffer.move_line_down(self.cx, self.cy) {
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
         }
     }
 
@@ -588,6 +732,77 @@ impl Editor {
         }
     }
 
+    /// Executes a single `Action` and returns `true` if subsequent chained actions should continue.
+    pub fn execute_action(&mut self, action: Action) -> bool {
+        match action {
+            Action::Quit => {
+                self.trigger_quit();
+                false
+            }
+            Action::Save => self.trigger_save(),
+            Action::Undo => {
+                self.trigger_undo();
+                true
+            }
+            Action::Redo => {
+                self.trigger_redo();
+                true
+            }
+            Action::Find => {
+                self.trigger_find();
+                false
+            }
+            Action::DuplicateLine => {
+                self.trigger_duplicate_line();
+                true
+            }
+            Action::DeleteLine => {
+                self.trigger_delete_line();
+                true
+            }
+            Action::MoveLineUp => {
+                self.trigger_move_line_up();
+                true
+            }
+            Action::MoveLineDown => {
+                self.trigger_move_line_down();
+                true
+            }
+            Action::InsertLineBelow => {
+                self.trigger_insert_line_below();
+                true
+            }
+            Action::InsertLineAbove => {
+                self.trigger_insert_line_above();
+                true
+            }
+            Action::Unindent => {
+                self.trigger_unindent();
+                true
+            }
+            Action::WordLeft => {
+                self.trigger_word_left();
+                true
+            }
+            Action::WordRight => {
+                self.trigger_word_right();
+                true
+            }
+            Action::DeleteWordLeft => {
+                self.trigger_delete_word_left();
+                true
+            }
+            Action::DeleteWordRight => {
+                self.trigger_delete_word_right();
+                true
+            }
+            Action::GotoLine => {
+                self.trigger_goto_line();
+                false
+            }
+        }
+    }
+
     /// Processes a single key event against the current editor state.
     pub fn handle_key_event(&mut self, key: KeyEvent, viewport_rows: usize) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -608,19 +823,8 @@ impl Editor {
                             self.status_message =
                                 Some("Save aborted: empty file name.".to_string());
                         } else {
-                            match self.buffer.save_as(&trimmed) {
-                                Ok(bytes) => {
-                                    let (tab_width, _) = self
-                                        .config
-                                        .resolve_filetype_settings(self.buffer.filename.as_deref());
-                                    self.buffer.set_tab_width(tab_width);
-                                    self.status_message =
-                                        Some(format!("Wrote {bytes} bytes to {trimmed}"));
-                                }
-                                Err(err) => {
-                                    self.status_message = Some(format!("Save error: {err}"));
-                                }
-                            }
+                            let res = self.buffer.save_as(&trimmed);
+                            self.handle_save_result(&trimmed, res);
                         }
                     }
                     KeyCode::Backspace => {
@@ -634,6 +838,36 @@ impl Editor {
                     {
                         input.push(c);
                         self.prompt = PromptState::SaveAs { input };
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            PromptState::ConfirmSudoSave { path } => {
+                match key.code {
+                    KeyCode::Char('y' | 'Y') | KeyCode::Enter
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        self.prompt = PromptState::None;
+                        match self.buffer.save_with_sudo(&path) {
+                            Ok(bytes) => {
+                                let (tab_width, _) = self
+                                    .config
+                                    .resolve_filetype_settings(self.buffer.filename.as_deref());
+                                self.buffer.set_tab_width(tab_width);
+                                self.status_message =
+                                    Some(format!("Wrote {bytes} bytes to {path} (sudo)"));
+                            }
+                            Err(err) => {
+                                self.status_message = Some(format!("Sudo save error: {err}"));
+                            }
+                        }
+                    }
+                    KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                        self.prompt = PromptState::None;
+                        self.status_message = Some("Save aborted (permission denied).".to_string());
                     }
                     _ => {}
                 }
@@ -812,6 +1046,20 @@ impl Editor {
             PromptState::None => {}
         }
 
+        if let Some(actions) = self.config.actions_for_key(key).map(|s| s.to_vec()) {
+            if actions.first() != Some(&Action::Quit) {
+                self.quit_confirm_pending = false;
+                self.status_message = None;
+            }
+            for action in actions {
+                let can_continue = self.execute_action(action);
+                if !can_continue || self.should_quit || self.prompt != PromptState::None {
+                    break;
+                }
+            }
+            return;
+        }
+
         let command = self.resolve_command(key);
 
         if command != EditorCommand::Action(Action::Quit) {
@@ -822,21 +1070,9 @@ impl Editor {
         }
 
         match command {
-            EditorCommand::Action(Action::Quit) => self.trigger_quit(),
-            EditorCommand::Action(Action::Save) => self.trigger_save(),
-            EditorCommand::Action(Action::Undo) => self.trigger_undo(),
-            EditorCommand::Action(Action::Redo) => self.trigger_redo(),
-            EditorCommand::Action(Action::Find) => self.trigger_find(),
-            EditorCommand::Action(Action::DuplicateLine) => self.trigger_duplicate_line(),
-            EditorCommand::Action(Action::DeleteLine) => self.trigger_delete_line(),
-            EditorCommand::Action(Action::InsertLineBelow) => self.trigger_insert_line_below(),
-            EditorCommand::Action(Action::InsertLineAbove) => self.trigger_insert_line_above(),
-            EditorCommand::Action(Action::Unindent) => self.trigger_unindent(),
-            EditorCommand::Action(Action::WordLeft) => self.trigger_word_left(),
-            EditorCommand::Action(Action::WordRight) => self.trigger_word_right(),
-            EditorCommand::Action(Action::DeleteWordLeft) => self.trigger_delete_word_left(),
-            EditorCommand::Action(Action::DeleteWordRight) => self.trigger_delete_word_right(),
-            EditorCommand::Action(Action::GotoLine) => self.trigger_goto_line(),
+            EditorCommand::Action(action) => {
+                self.execute_action(action);
+            }
             EditorCommand::Move(code) => self.move_cursor(code, viewport_rows),
             EditorCommand::InsertChar(c) => self.insert_char(c),
             EditorCommand::InsertNewline => self.insert_newline(),
@@ -1414,5 +1650,112 @@ mod tests {
         editor.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE), 24);
         editor.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 24);
         assert_eq!(editor.cy, 2);
+    }
+
+    #[test]
+    fn auto_pairs_inserts_skips_over_backspaces_and_respects_quote_context() {
+        let mut editor = Editor::new(Buffer::new());
+
+        // Typing '(' inserts "()" and places cursor at cx = 1
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('('), KeyModifiers::NONE), 24);
+        assert_eq!(editor.buffer.contents(), "()");
+        assert_eq!(editor.cx, 1);
+
+        // Typing ')' skips over existing ')' without inserting a duplicate
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char(')'), KeyModifiers::NONE), 24);
+        assert_eq!(editor.buffer.contents(), "()");
+        assert_eq!(editor.cx, 2);
+
+        // Move back inside "()" and press Backspace -> deletes both '(' and ')'
+        editor.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 24);
+        assert_eq!(editor.cx, 1);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), 24);
+        assert!(editor.buffer.is_empty());
+        assert_eq!(editor.cx, 0);
+
+        // Quote context awareness: typing "don't" does not auto-close the apostrophe after 'n'
+        for ch in "don't".chars() {
+            editor.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), 24);
+        }
+        assert_eq!(editor.buffer.contents(), "don't");
+    }
+
+    #[test]
+    fn action_chaining_executes_save_and_quit_or_aborts_when_prompt_opens() {
+        let cfg = Config::from_toml_str(
+            r#"
+[keys]
+"ctrl+shift+q" = ["save", "quit"]
+"#,
+        )
+        .unwrap();
+
+        // Unnamed dirty buffer: Save opens SaveAs prompt and aborts the chained Quit
+        let mut unnamed_editor = Editor::with_config(Buffer::from_lines(&["unsaved"]), cfg.clone());
+        unnamed_editor.buffer.dirty = true;
+        unnamed_editor.handle_key_event(
+            KeyEvent::new(
+                KeyCode::Char('Q'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            24,
+        );
+        assert!(!unnamed_editor.should_quit);
+        assert_eq!(
+            unnamed_editor.prompt,
+            PromptState::SaveAs {
+                input: String::new()
+            }
+        );
+
+        // Named dirty buffer: Save succeeds and chained Quit immediately exits
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("omo_chain_save_quit_{nanos}.txt"));
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut named_buf = Buffer::from_lines(&["saved content"]);
+        named_buf.filename = Some(path_str.clone());
+        named_buf.dirty = true;
+        let mut named_editor = Editor::with_config(named_buf, cfg);
+        named_editor.handle_key_event(
+            KeyEvent::new(
+                KeyCode::Char('Q'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            24,
+        );
+        assert!(named_editor.should_quit);
+        assert!(!named_editor.buffer.dirty);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved content\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn alt_up_and_alt_down_move_current_line_and_permission_denied_prompts_sudo() {
+        let mut editor = Editor::new(Buffer::from_lines(&["line 1", "line 2", "line 3"]));
+        editor.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), 24);
+        assert_eq!(editor.buffer.contents(), "line 2\nline 1\nline 3");
+        assert_eq!(editor.cy, 1);
+
+        editor.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), 24);
+        assert_eq!(editor.buffer.contents(), "line 1\nline 2\nline 3");
+        assert_eq!(editor.cy, 0);
+
+        // Simulate PermissionDenied on save -> transitions to ConfirmSudoSave prompt
+        let perm_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(!editor.handle_save_result("/etc/hosts", Err(perm_err.into())));
+        assert_eq!(
+            editor.prompt,
+            PromptState::ConfirmSudoSave {
+                path: "/etc/hosts".to_string()
+            }
+        );
+
+        // Pressing 'n' cancels the sudo save prompt cleanly
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), 24);
+        assert_eq!(editor.prompt, PromptState::None);
     }
 }
