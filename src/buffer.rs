@@ -1,7 +1,10 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use crate::config::DEFAULT_TAB_WIDTH;
 
@@ -550,14 +553,34 @@ impl Row {
         }
         matches
     }
+
+    /// Returns the logical character at `index`, if within bounds.
+    pub fn char_at(&self, index: usize) -> Option<char> {
+        self.buffer.chars().nth(index)
+    }
 }
 
 const MAX_UNDO_HISTORY: usize = 200;
 
+/// Detects whether an existing file path is read-only or not writable by the current process.
+pub fn detect_file_read_only(filename: &str) -> bool {
+    let Ok(meta) = fs::metadata(filename) else {
+        return false;
+    };
+    if meta.permissions().readonly() {
+        return true;
+    }
+    match fs::OpenOptions::new().write(true).open(filename) {
+        Ok(_) => false,
+        Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+    }
+}
+
 /// Captures a reversible snapshot of buffer rows, cursor position, and dirty state.
+/// Rows are stored via `Arc<Row>` so unchanged lines share memory across snapshots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferSnapshot {
-    pub rows: Vec<Row>,
+    pub rows: Vec<Arc<Row>>,
     pub cx: usize,
     pub cy: usize,
     pub dirty: bool,
@@ -565,9 +588,10 @@ pub struct BufferSnapshot {
 
 /// Holds the entirety of a text buffer.
 pub struct Buffer {
-    rows: Vec<Row>,
+    rows: Vec<Arc<Row>>,
     pub filename: Option<String>,
     pub dirty: bool,
+    pub read_only: bool,
     pub tab_width: usize,
     pub trailing_newline: bool,
     pub crlf: bool,
@@ -582,6 +606,7 @@ impl Default for Buffer {
             rows: Vec::new(),
             filename: None,
             dirty: false,
+            read_only: false,
             tab_width: DEFAULT_TAB_WIDTH,
             trailing_newline: true,
             crlf: false,
@@ -600,10 +625,13 @@ impl Buffer {
 
     /// Creates a new empty buffer associated with a target filename.
     pub fn with_filename(filename: impl Into<String>) -> Self {
+        let filename = filename.into();
+        let read_only = detect_file_read_only(&filename);
         Self {
             rows: Vec::new(),
-            filename: Some(filename.into()),
+            filename: Some(filename),
             dirty: false,
+            read_only,
             tab_width: DEFAULT_TAB_WIDTH,
             trailing_newline: true,
             crlf: false,
@@ -617,9 +645,10 @@ impl Buffer {
     #[allow(dead_code)]
     pub fn from_lines(lines: &[&str]) -> Self {
         Self {
-            rows: lines.iter().copied().map(Row::from).collect(),
+            rows: lines.iter().copied().map(Row::from).map(Arc::new).collect(),
             filename: None,
             dirty: false,
+            read_only: false,
             tab_width: DEFAULT_TAB_WIDTH,
             trailing_newline: true,
             crlf: false,
@@ -636,6 +665,7 @@ impl Buffer {
             Ok(contents) => {
                 let crlf = contents.contains("\r\n");
                 let trailing_newline = contents.is_empty() || contents.ends_with('\n');
+                let read_only = detect_file_read_only(filename);
                 let mut rows = Vec::new();
                 if !contents.is_empty() {
                     let body = contents
@@ -644,13 +674,14 @@ impl Buffer {
                         .unwrap_or(&contents);
                     for line in body.split('\n') {
                         let clean = line.strip_suffix('\r').unwrap_or(line);
-                        rows.push(Row::from(clean));
+                        rows.push(Arc::new(Row::from(clean)));
                     }
                 }
                 Ok(Self {
                     rows,
                     filename: Some(filename.to_string()),
                     dirty: false,
+                    read_only,
                     tab_width: DEFAULT_TAB_WIDTH,
                     trailing_newline,
                     crlf,
@@ -671,7 +702,9 @@ impl Buffer {
         let normalized = tab_width.max(1);
         self.tab_width = normalized;
         for row in &mut self.rows {
-            row.set_tab_width(normalized);
+            if row.tab_width != normalized {
+                Arc::make_mut(row).set_tab_width(normalized);
+            }
         }
     }
 
@@ -824,9 +857,10 @@ impl Buffer {
     /// Inserts a character at buffer coordinates `(cx, cy)` without recording a new undo snapshot.
     pub fn insert_char_no_snapshot(&mut self, cx: usize, cy: usize, c: char) {
         while self.rows.len() <= cy {
-            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
         }
-        self.rows[cy].insert_char(cx, c);
+        Arc::make_mut(&mut self.rows[cy]).insert_char(cx, c);
         self.dirty = true;
         self.coalesce_insert_pos = None;
     }
@@ -839,9 +873,10 @@ impl Buffer {
             self.record_snapshot(cx, cy);
         }
         while self.rows.len() <= cy {
-            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
         }
-        self.rows[cy].insert_char(cx, c);
+        Arc::make_mut(&mut self.rows[cy]).insert_char(cx, c);
         self.dirty = true;
         self.coalesce_insert_pos = if c.is_whitespace() {
             None
@@ -866,13 +901,16 @@ impl Buffer {
     ) -> (usize, usize) {
         self.record_snapshot(cx, cy);
         if self.rows.is_empty() {
-            self.rows.push(Row::with_tab_width("", self.tab_width));
-            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
             self.dirty = true;
             return (0, 1);
         }
         if cy >= self.rows.len() {
-            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
             self.dirty = true;
             return (0, self.rows.len() - 1);
         }
@@ -888,10 +926,10 @@ impl Buffer {
             String::new()
         };
         let indent_len = indent.chars().count();
-        let tail = self.rows[cy].split(cx);
+        let tail = Arc::make_mut(&mut self.rows[cy]).split(cx);
         let mut new_row = Row::with_tab_width(&indent, self.tab_width);
         new_row.append(&tail);
-        self.rows.insert(cy + 1, new_row);
+        self.rows.insert(cy + 1, Arc::new(new_row));
         self.dirty = true;
         (indent_len, cy + 1)
     }
@@ -901,8 +939,10 @@ impl Buffer {
     pub fn insert_line_below(&mut self, cx: usize, cy: usize) -> (usize, usize) {
         self.record_snapshot(cx, cy);
         if self.rows.is_empty() {
-            self.rows.push(Row::with_tab_width("", self.tab_width));
-            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
             self.dirty = true;
             return (0, 1);
         }
@@ -915,7 +955,7 @@ impl Buffer {
             .collect();
         let new_cx = indent.chars().count();
         let new_row = Row::with_tab_width(&indent, self.tab_width);
-        self.rows.insert(target_cy + 1, new_row);
+        self.rows.insert(target_cy + 1, Arc::new(new_row));
         self.dirty = true;
         (new_cx, target_cy + 1)
     }
@@ -925,7 +965,8 @@ impl Buffer {
     pub fn insert_line_above(&mut self, cx: usize, cy: usize) -> (usize, usize) {
         self.record_snapshot(cx, cy);
         if self.rows.is_empty() {
-            self.rows.push(Row::with_tab_width("", self.tab_width));
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
             self.dirty = true;
             return (0, 0);
         }
@@ -938,7 +979,7 @@ impl Buffer {
             .collect();
         let new_cx = indent.chars().count();
         let new_row = Row::with_tab_width(&indent, self.tab_width);
-        self.rows.insert(target_cy, new_row);
+        self.rows.insert(target_cy, Arc::new(new_row));
         self.dirty = true;
         (new_cx, target_cy)
     }
@@ -949,8 +990,30 @@ impl Buffer {
             return None;
         }
         self.record_snapshot(cx, cy);
-        let cloned = self.rows[cy].clone();
+        let cloned = Arc::clone(&self.rows[cy]);
         self.rows.insert(cy + 1, cloned);
+        self.dirty = true;
+        Some((cx.min(self.rows[cy + 1].len), cy + 1))
+    }
+
+    /// Moves the row at `cy` up by one line (`cy - 1`), returning the new `(cx, cy - 1)`.
+    pub fn move_line_up(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
+        if cy == 0 || cy >= self.rows.len() {
+            return None;
+        }
+        self.record_snapshot(cx, cy);
+        self.rows.swap(cy - 1, cy);
+        self.dirty = true;
+        Some((cx.min(self.rows[cy - 1].len), cy - 1))
+    }
+
+    /// Moves the row at `cy` down by one line (`cy + 1`), returning the new `(cx, cy + 1)`.
+    pub fn move_line_down(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
+        if cy + 1 >= self.rows.len() {
+            return None;
+        }
+        self.record_snapshot(cx, cy);
+        self.rows.swap(cy, cy + 1);
         self.dirty = true;
         Some((cx.min(self.rows[cy + 1].len), cy + 1))
     }
@@ -981,8 +1044,9 @@ impl Buffer {
         }
 
         self.record_snapshot(cx, cy);
+        let row_mut = Arc::make_mut(&mut self.rows[cy]);
         for _ in 0..remove_count {
-            self.rows[cy].delete_char(0);
+            row_mut.delete_char(0);
         }
         if self.rows.len() == 1 && self.rows[0].len == 0 {
             self.rows.clear();
@@ -1067,8 +1131,9 @@ impl Buffer {
             return None;
         }
         self.record_snapshot(cx, cy);
+        let row_mut = Arc::make_mut(&mut self.rows[cy]);
         for _ in 0..count {
-            self.rows[cy].delete_char(target_cx);
+            row_mut.delete_char(target_cx);
         }
         if self.rows.len() == 1 && self.rows[0].len == 0 {
             self.rows.clear();
@@ -1096,8 +1161,9 @@ impl Buffer {
             return false;
         }
         self.record_snapshot(cx, cy);
+        let row_mut = Arc::make_mut(&mut self.rows[cy]);
         for _ in 0..count {
-            self.rows[cy].delete_char(clamped_cx);
+            row_mut.delete_char(clamped_cx);
         }
         if self.rows.len() == 1 && self.rows[0].len == 0 {
             self.rows.clear();
@@ -1106,63 +1172,79 @@ impl Buffer {
         true
     }
 
-    /// Performs a backspace operation from `(cx, cy)`, returning the new `(cx, cy)` cursor
-    /// position if a character or line break was deleted.
-    pub fn delete_char(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
+    /// Performs a backspace operation from `(cx, cy)` without recording a new snapshot.
+    pub fn delete_char_no_snapshot(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
         if cy >= self.rows.len() {
             return None;
         }
-
         if cx > 0 {
-            self.record_snapshot(cx, cy);
             let target_cx = cx.min(self.rows[cy].len) - 1;
-            self.rows[cy].delete_char(target_cx);
+            Arc::make_mut(&mut self.rows[cy]).delete_char(target_cx);
             if self.rows.len() == 1 && self.rows[0].len == 0 {
                 self.rows.clear();
             }
             self.dirty = true;
+            self.coalesce_insert_pos = None;
             Some((target_cx, cy))
         } else if cy > 0 {
-            self.record_snapshot(cx, cy);
             let current_row = self.rows.remove(cy);
             let prev_len = self.rows[cy - 1].len;
-            self.rows[cy - 1].append(&current_row);
+            Arc::make_mut(&mut self.rows[cy - 1]).append(&current_row);
             if self.rows.len() == 1 && self.rows[0].len == 0 {
                 self.rows.clear();
             }
             self.dirty = true;
+            self.coalesce_insert_pos = None;
             Some((prev_len, cy - 1))
         } else {
             None
         }
     }
 
-    /// Deletes the character under `(cx, cy)` or joins the next line onto the current row.
-    pub fn delete_forward(&mut self, cx: usize, cy: usize) -> bool {
+    /// Performs a backspace operation from `(cx, cy)`, returning the new `(cx, cy)` cursor
+    /// position if a character or line break was deleted.
+    pub fn delete_char(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
+        if cy >= self.rows.len() || (cx == 0 && cy == 0) {
+            return None;
+        }
+        self.record_snapshot(cx, cy);
+        self.delete_char_no_snapshot(cx, cy)
+    }
+
+    /// Deletes the character under `(cx, cy)` without recording a new snapshot.
+    pub fn delete_forward_no_snapshot(&mut self, cx: usize, cy: usize) -> bool {
         if cy >= self.rows.len() {
             return false;
         }
-
         if cx < self.rows[cy].len {
-            self.record_snapshot(cx, cy);
-            self.rows[cy].delete_char(cx);
+            Arc::make_mut(&mut self.rows[cy]).delete_char(cx);
             if self.rows.len() == 1 && self.rows[0].len == 0 {
                 self.rows.clear();
             }
             self.dirty = true;
+            self.coalesce_insert_pos = None;
             true
         } else if cy + 1 < self.rows.len() {
-            self.record_snapshot(cx, cy);
             let next_row = self.rows.remove(cy + 1);
-            self.rows[cy].append(&next_row);
+            Arc::make_mut(&mut self.rows[cy]).append(&next_row);
             if self.rows.len() == 1 && self.rows[0].len == 0 {
                 self.rows.clear();
             }
             self.dirty = true;
+            self.coalesce_insert_pos = None;
             true
         } else {
             false
         }
+    }
+
+    /// Deletes the character under `(cx, cy)` or joins the next line onto the current row.
+    pub fn delete_forward(&mut self, cx: usize, cy: usize) -> bool {
+        if cy >= self.rows.len() || (cx >= self.rows[cy].len && cy + 1 >= self.rows.len()) {
+            return false;
+        }
+        self.record_snapshot(cx, cy);
+        self.delete_forward_no_snapshot(cx, cy)
     }
 
     /// Deletes the entire row at `cy`, recording an undo snapshot and returning the clamped
@@ -1188,9 +1270,37 @@ impl Buffer {
     pub fn contents(&self) -> String {
         self.rows
             .iter()
-            .map(Row::text)
+            .map(|r| r.text())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Serializes the buffer for saving to disk, honoring `self.crlf` and `self.trailing_newline`.
+    pub fn serialized_bytes(&self) -> String {
+        let line_ending = if self.crlf { "\r\n" } else { "\n" };
+        let mut data = self
+            .rows
+            .iter()
+            .map(|r| r.text())
+            .collect::<Vec<_>>()
+            .join(line_ending);
+        if !self.rows.is_empty() && self.trailing_newline {
+            data.push_str(line_ending);
+        }
+        data
+    }
+
+    fn mark_saved(&mut self, filename: String) {
+        self.read_only = detect_file_read_only(&filename);
+        self.filename = Some(filename);
+        self.dirty = false;
+        self.coalesce_insert_pos = None;
+        for snap in &mut self.undo_stack {
+            snap.dirty = true;
+        }
+        for snap in &mut self.redo_stack {
+            snap.dirty = true;
+        }
     }
 
     /// Writes the buffer to its associated `filename` and clears `dirty`.
@@ -1205,32 +1315,69 @@ impl Buffer {
     /// Writes the buffer to `filename`, updates `self.filename`, and clears `dirty`.
     pub fn save_as(&mut self, filename: impl Into<String>) -> Result<usize> {
         let filename = filename.into();
-        let line_ending = if self.crlf { "\r\n" } else { "\n" };
-        let mut data = self
-            .rows
-            .iter()
-            .map(Row::text)
-            .collect::<Vec<_>>()
-            .join(line_ending);
-        if !self.rows.is_empty() && self.trailing_newline {
-            data.push_str(line_ending);
-        }
+        let data = self.serialized_bytes();
         fs::write(&filename, &data)?;
-        self.filename = Some(filename);
-        self.dirty = false;
-        self.coalesce_insert_pos = None;
-        for snap in &mut self.undo_stack {
-            snap.dirty = true;
+        let len = data.len();
+        self.mark_saved(filename);
+        Ok(len)
+    }
+
+    fn pipe_to_sudo_tee(filename: &str, data: &str) -> Result<()> {
+        let mut child = Command::new("sudo")
+            .args(["-n", "tee", "--", filename])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(data.as_bytes())?;
         }
-        for snap in &mut self.redo_stack {
-            snap.dirty = true;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            bail!(if stderr.is_empty() {
+                "sudo tee failed".to_string()
+            } else {
+                stderr
+            });
         }
-        Ok(data.len())
+        Ok(())
+    }
+
+    /// Writes the buffer to `filename` using `sudo tee`, suspending the terminal to run
+    /// interactive `sudo -v` if cached credentials are not available.
+    pub fn save_with_sudo(&mut self, filename: impl Into<String>) -> Result<usize> {
+        let filename = filename.into();
+        let data = self.serialized_bytes();
+        if Self::pipe_to_sudo_tee(&filename, &data).is_err() {
+            crate::terminal::Terminal::with_suspended(|| {
+                let status = Command::new("sudo").arg("-v").status()?;
+                if !status.success() {
+                    bail!("sudo authentication failed");
+                }
+                Self::pipe_to_sudo_tee(&filename, &data)
+            })?;
+        }
+        let len = data.len();
+        self.mark_saved(filename);
+        Ok(len)
     }
 
     /// Returns a reference to the row at the given index if it exists.
     pub fn get_row(&self, index: usize) -> Option<&Row> {
+        self.rows.get(index).map(Arc::as_ref)
+    }
+
+    /// Returns a reference to the `Arc<Row>` at the given index if it exists.
+    #[allow(dead_code)]
+    pub fn row_arc(&self, index: usize) -> Option<&Arc<Row>> {
         self.rows.get(index)
+    }
+
+    /// Returns a reference to the most recent snapshot on `undo_stack` (for testing CoW sharing).
+    #[cfg(test)]
+    pub fn last_undo_snapshot(&self) -> Option<&BufferSnapshot> {
+        self.undo_stack.back()
     }
 
     /// Returns the number of rows in the buffer.
@@ -1506,5 +1653,65 @@ mod tests {
         let last_pos = buf.delete_line(8, 2);
         assert_eq!(last_pos, Some((6, 1)));
         assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn cow_arc_row_snapshots_share_unchanged_rows_and_clone_only_mutated_row() {
+        let mut buf = Buffer::from_lines(&["unchanged 0", "mutated 1", "unchanged 2"]);
+        let row0_before = Arc::clone(buf.row_arc(0).unwrap());
+        let row1_before = Arc::clone(buf.row_arc(1).unwrap());
+        let row2_before = Arc::clone(buf.row_arc(2).unwrap());
+
+        buf.insert_char(9, 1, '!');
+
+        let snap = buf.last_undo_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&snap.rows[0], &row0_before));
+        assert!(Arc::ptr_eq(&snap.rows[1], &row1_before));
+        assert!(Arc::ptr_eq(&snap.rows[2], &row2_before));
+
+        // Unchanged rows in active buffer still point to the exact same Arc allocation
+        assert!(Arc::ptr_eq(buf.row_arc(0).unwrap(), &row0_before));
+        assert!(Arc::ptr_eq(buf.row_arc(2).unwrap(), &row2_before));
+        // Only the mutated row was cloned-on-write
+        assert!(!Arc::ptr_eq(buf.row_arc(1).unwrap(), &row1_before));
+        assert_eq!(buf.get_row(1).unwrap().text(), "mutated 1!");
+    }
+
+    #[test]
+    fn move_line_up_and_down_swap_rows_and_support_undo() {
+        let mut buf = Buffer::from_lines(&["first", "second", "third"]);
+        assert_eq!(buf.move_line_up(2, 0), None);
+        assert_eq!(buf.move_line_down(2, 0), Some((2, 1)));
+        assert_eq!(buf.contents(), "second\nfirst\nthird");
+
+        assert_eq!(buf.move_line_up(2, 1), Some((2, 0)));
+        assert_eq!(buf.contents(), "first\nsecond\nthird");
+    }
+
+    #[test]
+    fn detect_file_read_only_identifies_readonly_permissions() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("omo_ro_test_{nanos}.txt"));
+        let path_str = path.to_string_lossy().to_string();
+
+        fs::write(&path, "protected\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms.clone()).unwrap();
+
+        let loaded = Buffer::open(&path_str).unwrap();
+        assert!(loaded.read_only);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut writable = perms;
+            writable.set_mode(0o644);
+            let _ = fs::set_permissions(&path, writable);
+        }
+        let _ = fs::remove_file(&path);
     }
 }
