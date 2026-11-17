@@ -10,7 +10,10 @@ use crossterm::{
 };
 use std::io::{Write, stdout};
 
-use crate::buffer::{Buffer, char_display_width, sanitize_render_char, str_display_width};
+use crate::buffer::{
+    Buffer, Position, Selection, char_display_width, sanitize_render_char, str_display_width,
+};
+use crate::clipboard::ClipboardManager;
 use crate::config::{Action, Config};
 use crate::terminal::Terminal;
 
@@ -90,7 +93,8 @@ fn is_matching_empty_pair(left: char, right: char) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorCommand {
     Action(Action),
-    Move(KeyCode),
+    Move { code: KeyCode, select: bool },
+    MoveWord { forward: bool, select: bool },
     InsertChar(char),
     InsertNewline,
     Backspace,
@@ -103,6 +107,8 @@ pub struct Editor {
     should_quit: bool,
     buffer: Buffer,
     pub config: Config,
+    pub selection: Option<Selection>,
+    pub clipboard: ClipboardManager,
     cx: usize,
     cy: usize,
     rx: usize,
@@ -135,6 +141,8 @@ impl Editor {
             should_quit: false,
             buffer,
             config,
+            selection: None,
+            clipboard: ClipboardManager::new(),
             cx: 0,
             cy: 0,
             rx: 0,
@@ -145,6 +153,11 @@ impl Editor {
             status_message,
             prompt: PromptState::None,
         }
+    }
+
+    /// Returns the active non-empty selection, if any.
+    pub fn active_selection(&self) -> Option<Selection> {
+        self.selection.filter(|s| !s.is_empty())
     }
 
     /// The main event loop.
@@ -392,10 +405,74 @@ impl Editor {
         }
     }
 
+    /// Moves the cursor with optional selection extension (`Shift` held).
+    pub fn move_cursor_with_selection(
+        &mut self,
+        code: KeyCode,
+        viewport_rows: usize,
+        select: bool,
+    ) {
+        if select {
+            let anchor = self
+                .selection
+                .map_or(Position::new(self.cy, self.cx), |s| s.anchor);
+            self.move_cursor(code, viewport_rows);
+            let head = Position::new(self.cy, self.cx);
+            self.selection = if anchor == head {
+                None
+            } else {
+                Some(Selection::new(anchor, head))
+            };
+        } else {
+            self.selection = None;
+            self.move_cursor(code, viewport_rows);
+        }
+    }
+
+    /// Moves the cursor by one word left or right with optional selection extension.
+    pub fn move_word_with_selection(&mut self, forward: bool, select: bool) {
+        if select {
+            let anchor = self
+                .selection
+                .map_or(Position::new(self.cy, self.cx), |s| s.anchor);
+            if forward {
+                self.trigger_word_right_raw();
+            } else {
+                self.trigger_word_left_raw();
+            }
+            let head = Position::new(self.cy, self.cx);
+            self.selection = if anchor == head {
+                None
+            } else {
+                Some(Selection::new(anchor, head))
+            };
+        } else {
+            self.selection = None;
+            if forward {
+                self.trigger_word_right_raw();
+            } else {
+                self.trigger_word_left_raw();
+            }
+        }
+    }
+
     /// Inserts a single character at the cursor position and advances `cx`.
     /// When `auto_pairs` is enabled for the active buffer, handles closing-delimiter skip-over
     /// and auto-inserts matching closing brackets/quotes with context awareness.
     pub fn insert_char(&mut self, c: char) {
+        if let Some(sel) = self.active_selection() {
+            let (start, end) = sel.ordered();
+            self.buffer.record_snapshot(self.cx, self.cy);
+            let pos = self.buffer.delete_range_no_snapshot(start, end);
+            self.selection = None;
+            self.cx = pos.col;
+            self.cy = pos.row;
+            self.buffer.insert_char_no_snapshot(self.cx, self.cy, c);
+            self.cx += 1;
+            self.desired_cx = self.visual_cx();
+            return;
+        }
+
         let auto_pairs = self
             .config
             .resolve_auto_pairs(self.buffer.filename.as_deref());
@@ -443,7 +520,30 @@ impl Editor {
 
     /// Inserts either soft-tab spaces up to the next tab stop (when `expand_tabs` is `true`
     /// for the active file type) or a literal `'\t'` character (when `expand_tabs` is `false`).
+    /// When a selection is active, indents all lines covered by the selection by one tab stop.
     pub fn insert_tab(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start_row, end_row) = sel.line_range();
+            let (tab_width, expand_tabs) = self
+                .config
+                .resolve_filetype_settings(self.buffer.filename.as_deref());
+            self.cx = self.buffer.indent_lines(
+                start_row,
+                end_row,
+                tab_width,
+                expand_tabs,
+                self.cx,
+                self.cy,
+            );
+            let end_col = self.buffer.get_row(end_row).map_or(0, |r| r.len);
+            self.selection = Some(Selection::new(
+                Position::new(start_row, 0),
+                Position::new(end_row, end_col),
+            ));
+            self.desired_cx = self.visual_cx();
+            return;
+        }
+
         let (tab_width, expand_tabs) = self
             .config
             .resolve_filetype_settings(self.buffer.filename.as_deref());
@@ -463,8 +563,20 @@ impl Editor {
     }
 
     /// Splits the current line at the cursor (preserving indentation when `auto_indent` is enabled)
-    /// and moves to the new line.
+    /// and moves to the new line. Replaces any active selection first.
     pub fn insert_newline(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start, end) = sel.ordered();
+            self.buffer.record_snapshot(self.cx, self.cy);
+            let pos = self.buffer.delete_range_no_snapshot(start, end);
+            self.selection = None;
+            let (new_cx, new_cy) = self.buffer.insert_str_no_snapshot(pos.col, pos.row, "\n");
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
+            return;
+        }
+
         let (new_cx, new_cy) =
             self.buffer
                 .insert_newline_with_indent(self.cx, self.cy, self.config.auto_indent);
@@ -473,10 +585,20 @@ impl Editor {
         self.desired_cx = self.visual_cx();
     }
 
-    /// Deletes the character to the left of the cursor or joins with the previous line.
+    /// Deletes the character to the left of the cursor (or the active selection) or joins with the previous line.
     /// When `auto_pairs` is enabled and the cursor sits inside an empty delimiter pair `(|)`,
     /// deletes both delimiters in a single undo step.
     pub fn backspace(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start, end) = sel.ordered();
+            let pos = self.buffer.delete_range(start, end, self.cx, self.cy);
+            self.selection = None;
+            self.cx = pos.col;
+            self.cy = pos.row;
+            self.desired_cx = self.visual_cx();
+            return;
+        }
+
         if self
             .config
             .resolve_auto_pairs(self.buffer.filename.as_deref())
@@ -502,8 +624,18 @@ impl Editor {
         }
     }
 
-    /// Deletes the character under the cursor or joins the next line.
+    /// Deletes the character under the cursor (or the active selection) or joins the next line.
     pub fn delete_forward(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start, end) = sel.ordered();
+            let pos = self.buffer.delete_range(start, end, self.cx, self.cy);
+            self.selection = None;
+            self.cx = pos.col;
+            self.cy = pos.row;
+            self.desired_cx = self.visual_cx();
+            return;
+        }
+
         self.buffer.delete_forward(self.cx, self.cy);
         self.desired_cx = self.visual_cx();
     }
@@ -563,6 +695,7 @@ impl Editor {
 
     /// Reverts the most recent buffer edit and restores its cursor coordinates.
     pub fn trigger_undo(&mut self) {
+        self.selection = None;
         if let Some((cx, cy)) = self.buffer.undo(self.cx, self.cy) {
             self.cx = cx;
             self.cy = cy;
@@ -575,6 +708,7 @@ impl Editor {
 
     /// Reapplies the most recently undone buffer edit and restores its cursor coordinates.
     pub fn trigger_redo(&mut self) {
+        self.selection = None;
         if let Some((cx, cy)) = self.buffer.redo(self.cx, self.cy) {
             self.cx = cx;
             self.cy = cy;
@@ -585,8 +719,95 @@ impl Editor {
         }
     }
 
+    /// Copies the active selection (or the current line when no selection is active) to the clipboard.
+    pub fn trigger_copy(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start, end) = sel.ordered();
+            let text = self.buffer.extract_range(start, end);
+            let char_count = text.chars().count();
+            self.clipboard.set_text(text);
+            self.status_message = Some(format!("Copied {char_count} chars."));
+        } else if let Some(row) = self.buffer.get_row(self.cy) {
+            let text = format!("{}\n", row.text());
+            self.clipboard.set_text(text);
+            self.status_message = Some("Copied 1 line.".to_string());
+        }
+    }
+
+    /// Cuts the active selection (or the current line when no selection is active) to the clipboard.
+    pub fn trigger_cut(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start, end) = sel.ordered();
+            let text = self.buffer.extract_range(start, end);
+            let char_count = text.chars().count();
+            self.clipboard.set_text(text);
+            let pos = self.buffer.delete_range(start, end, self.cx, self.cy);
+            self.selection = None;
+            self.cx = pos.col;
+            self.cy = pos.row;
+            self.desired_cx = self.visual_cx();
+            self.status_message = Some(format!("Cut {char_count} chars."));
+        } else if let Some(row) = self.buffer.get_row(self.cy) {
+            let text = format!("{}\n", row.text());
+            self.clipboard.set_text(text);
+            if let Some((_, new_cy)) = self.buffer.delete_line(self.cx, self.cy) {
+                self.cy = new_cy;
+                self.cx = self
+                    .buffer
+                    .get_row(self.cy)
+                    .map_or(0, |r| r.rx_to_cx(self.desired_cx));
+            }
+            self.status_message = Some("Cut 1 line.".to_string());
+        }
+    }
+
+    /// Pastes clipboard contents at the cursor (replacing any active selection) in a single undo step.
+    pub fn trigger_paste(&mut self) {
+        let text = self.clipboard.get_text();
+        if text.is_empty() {
+            return;
+        }
+        self.buffer.break_undo_coalesce();
+        if let Some(sel) = self.active_selection() {
+            let (start, end) = sel.ordered();
+            self.buffer.record_snapshot(self.cx, self.cy);
+            let pos = self.buffer.delete_range_no_snapshot(start, end);
+            self.selection = None;
+            let (new_cx, new_cy) = self.buffer.insert_str_no_snapshot(pos.col, pos.row, &text);
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
+        } else {
+            let (new_cx, new_cy) = self.buffer.insert_str(self.cx, self.cy, &text);
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
+        }
+    }
+
+    /// Selects the entire buffer and places the cursor at the end of the document.
+    pub fn trigger_select_all(&mut self) {
+        if self.buffer.is_empty() {
+            self.selection = None;
+            return;
+        }
+        let last_row = self.buffer.len() - 1;
+        let last_col = self.buffer.get_row(last_row).map_or(0, |r| r.len);
+        let start = Position::new(0, 0);
+        let end = Position::new(last_row, last_col);
+        if start == end {
+            self.selection = None;
+        } else {
+            self.selection = Some(Selection::new(start, end));
+        }
+        self.cy = last_row;
+        self.cx = last_col;
+        self.desired_cx = self.visual_cx();
+    }
+
     /// Duplicates the current line directly below and moves the cursor to the duplicated line.
     pub fn trigger_duplicate_line(&mut self) {
+        self.selection = None;
         if let Some((new_cx, new_cy)) = self.buffer.duplicate_line(self.cx, self.cy) {
             self.cx = new_cx;
             self.cy = new_cy;
@@ -596,6 +817,7 @@ impl Editor {
 
     /// Deletes the current line and clamps the cursor to the remaining buffer rows.
     pub fn trigger_delete_line(&mut self) {
+        self.selection = None;
         if let Some((_, new_cy)) = self.buffer.delete_line(self.cx, self.cy) {
             self.cy = new_cy;
             self.cx = self
@@ -605,8 +827,27 @@ impl Editor {
         }
     }
 
-    /// Moves the current line up by one row (`Alt+Up`).
+    /// Moves the current line (or selected line block) up by one row (`Alt+Up`).
     pub fn trigger_move_line_up(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start_row, end_row) = sel.line_range();
+            if self
+                .buffer
+                .move_lines_up(start_row, end_row, self.cx, self.cy)
+            {
+                self.cy = self.cy.saturating_sub(1);
+                let new_start = start_row - 1;
+                let new_end = end_row - 1;
+                let end_col = self.buffer.get_row(new_end).map_or(0, |r| r.len);
+                self.selection = Some(Selection::new(
+                    Position::new(new_start, 0),
+                    Position::new(new_end, end_col),
+                ));
+                self.desired_cx = self.visual_cx();
+            }
+            return;
+        }
+
         if let Some((new_cx, new_cy)) = self.buffer.move_line_up(self.cx, self.cy) {
             self.cx = new_cx;
             self.cy = new_cy;
@@ -614,8 +855,27 @@ impl Editor {
         }
     }
 
-    /// Moves the current line down by one row (`Alt+Down`).
+    /// Moves the current line (or selected line block) down by one row (`Alt+Down`).
     pub fn trigger_move_line_down(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start_row, end_row) = sel.line_range();
+            if self
+                .buffer
+                .move_lines_down(start_row, end_row, self.cx, self.cy)
+            {
+                self.cy = (self.cy + 1).min(self.buffer.len().saturating_sub(1));
+                let new_start = start_row + 1;
+                let new_end = end_row + 1;
+                let end_col = self.buffer.get_row(new_end).map_or(0, |r| r.len);
+                self.selection = Some(Selection::new(
+                    Position::new(new_start, 0),
+                    Position::new(new_end, end_col),
+                ));
+                self.desired_cx = self.visual_cx();
+            }
+            return;
+        }
+
         if let Some((new_cx, new_cy)) = self.buffer.move_line_down(self.cx, self.cy) {
             self.cx = new_cx;
             self.cy = new_cy;
@@ -626,6 +886,7 @@ impl Editor {
     /// Inserts a new line below the current row at the same indentation level without splitting
     /// the current line, and moves the cursor to the end of the new line's indentation.
     pub fn trigger_insert_line_below(&mut self) {
+        self.selection = None;
         let (new_cx, new_cy) = self.buffer.insert_line_below(self.cx, self.cy);
         self.cx = new_cx;
         self.cy = new_cy;
@@ -635,22 +896,44 @@ impl Editor {
     /// Inserts a new line above the current row at the same indentation level without splitting
     /// the current line, and moves the cursor to the end of the new line's indentation.
     pub fn trigger_insert_line_above(&mut self) {
+        self.selection = None;
         let (new_cx, new_cy) = self.buffer.insert_line_above(self.cx, self.cy);
         self.cx = new_cx;
         self.cy = new_cy;
         self.desired_cx = self.visual_cx();
     }
 
-    /// Removes one tab stop of leading indentation from the current line.
+    /// Indents the active selection block (or inserts a tab at the cursor when no selection is active).
+    pub fn trigger_indent(&mut self) {
+        self.insert_tab();
+    }
+
+    /// Removes one tab stop of leading indentation from the active selection block or current line.
     pub fn trigger_unindent(&mut self) {
+        if let Some(sel) = self.active_selection() {
+            let (start_row, end_row) = sel.line_range();
+            self.cx = self
+                .buffer
+                .unindent_lines(start_row, end_row, self.cx, self.cy);
+            let end_col = self.buffer.get_row(end_row).map_or(0, |r| r.len);
+            let new_sel =
+                Selection::new(Position::new(start_row, 0), Position::new(end_row, end_col));
+            self.selection = if new_sel.is_empty() {
+                None
+            } else {
+                Some(new_sel)
+            };
+            self.desired_cx = self.visual_cx();
+            return;
+        }
+
         if let Some(new_cx) = self.buffer.unindent_line(self.cx, self.cy) {
             self.cx = new_cx;
             self.desired_cx = self.visual_cx();
         }
     }
 
-    /// Moves the cursor to the previous word boundary.
-    pub fn trigger_word_left(&mut self) {
+    fn trigger_word_left_raw(&mut self) {
         self.buffer.break_undo_coalesce();
         let (new_cx, new_cy) = self.buffer.word_boundary_left(self.cx, self.cy);
         self.cx = new_cx;
@@ -658,8 +941,7 @@ impl Editor {
         self.desired_cx = self.visual_cx();
     }
 
-    /// Moves the cursor to the next word boundary.
-    pub fn trigger_word_right(&mut self) {
+    fn trigger_word_right_raw(&mut self) {
         self.buffer.break_undo_coalesce();
         let (new_cx, new_cy) = self.buffer.word_boundary_right(self.cx, self.cy);
         self.cx = new_cx;
@@ -667,8 +949,24 @@ impl Editor {
         self.desired_cx = self.visual_cx();
     }
 
-    /// Deletes the word to the left of the cursor.
+    /// Moves the cursor to the previous word boundary, clearing any active selection.
+    pub fn trigger_word_left(&mut self) {
+        self.selection = None;
+        self.trigger_word_left_raw();
+    }
+
+    /// Moves the cursor to the next word boundary, clearing any active selection.
+    pub fn trigger_word_right(&mut self) {
+        self.selection = None;
+        self.trigger_word_right_raw();
+    }
+
+    /// Deletes the word to the left of the cursor (or the active selection).
     pub fn trigger_delete_word_left(&mut self) {
+        if self.active_selection().is_some() {
+            self.backspace();
+            return;
+        }
         if let Some((new_cx, new_cy)) = self.buffer.delete_word_left(self.cx, self.cy) {
             self.cx = new_cx;
             self.cy = new_cy;
@@ -676,8 +974,12 @@ impl Editor {
         }
     }
 
-    /// Deletes the word to the right of the cursor.
+    /// Deletes the word to the right of the cursor (or the active selection).
     pub fn trigger_delete_word_right(&mut self) {
+        if self.active_selection().is_some() {
+            self.delete_forward();
+            return;
+        }
         self.buffer.delete_word_right(self.cx, self.cy);
         self.desired_cx = self.visual_cx();
     }
@@ -701,8 +1003,21 @@ impl Editor {
         self.status_message = None;
     }
 
-    /// Translates a `KeyEvent` into a unified `EditorCommand`, checking `Config` action bindings first.
+    /// Translates a `KeyEvent` into a unified `EditorCommand`, checking shifted selection
+    /// movement and `Config` action bindings.
     pub fn resolve_command(&self, key: KeyEvent) -> EditorCommand {
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            return EditorCommand::MoveWord {
+                forward: key.code == KeyCode::Right,
+                select: true,
+            };
+        }
+
         if let Some(action) = self.config.action_for_key(key) {
             return EditorCommand::Action(action);
         }
@@ -721,8 +1036,13 @@ impl Editor {
                 | KeyCode::End
                 | KeyCode::PageUp
                 | KeyCode::PageDown,
-                _,
-            ) => EditorCommand::Move(key.code),
+                modifiers,
+            ) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                EditorCommand::Move {
+                    code: key.code,
+                    select: modifiers.contains(KeyModifiers::SHIFT),
+                }
+            }
             (KeyCode::Char(c), modifiers)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
@@ -752,6 +1072,22 @@ impl Editor {
                 self.trigger_find();
                 false
             }
+            Action::Copy => {
+                self.trigger_copy();
+                true
+            }
+            Action::Cut => {
+                self.trigger_cut();
+                true
+            }
+            Action::Paste => {
+                self.trigger_paste();
+                true
+            }
+            Action::SelectAll => {
+                self.trigger_select_all();
+                true
+            }
             Action::DuplicateLine => {
                 self.trigger_duplicate_line();
                 true
@@ -774,6 +1110,10 @@ impl Editor {
             }
             Action::InsertLineAbove => {
                 self.trigger_insert_line_above();
+                true
+            }
+            Action::Indent => {
+                self.trigger_indent();
                 true
             }
             Action::Unindent => {
@@ -1046,7 +1386,15 @@ impl Editor {
             PromptState::None => {}
         }
 
-        if let Some(actions) = self.config.actions_for_key(key).map(|s| s.to_vec()) {
+        let is_shifted_word_move = key.modifiers.contains(KeyModifiers::SHIFT)
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Left | KeyCode::Right);
+
+        if !is_shifted_word_move
+            && let Some(actions) = self.config.actions_for_key(key).map(|s| s.to_vec())
+        {
             if actions.first() != Some(&Action::Quit) {
                 self.quit_confirm_pending = false;
                 self.status_message = None;
@@ -1073,7 +1421,12 @@ impl Editor {
             EditorCommand::Action(action) => {
                 self.execute_action(action);
             }
-            EditorCommand::Move(code) => self.move_cursor(code, viewport_rows),
+            EditorCommand::Move { code, select } => {
+                self.move_cursor_with_selection(code, viewport_rows, select)
+            }
+            EditorCommand::MoveWord { forward, select } => {
+                self.move_word_with_selection(forward, select)
+            }
             EditorCommand::InsertChar(c) => self.insert_char(c),
             EditorCommand::InsertNewline => self.insert_newline(),
             EditorCommand::Backspace => self.backspace(),
@@ -1102,6 +1455,10 @@ impl Editor {
 
         let mut stdout = stdout();
 
+        if let Some(osc52) = self.clipboard.take_osc52_sequence() {
+            queue!(stdout, Print(osc52))?;
+        }
+
         queue!(stdout, cursor::Hide, cursor::MoveTo(0, 0))?;
         self.draw_rows(&mut stdout, cols, rows)?;
         self.draw_status_bar(&mut stdout, cols)?;
@@ -1110,6 +1467,80 @@ impl Editor {
         queue!(stdout, cursor::MoveTo(screen_cx, screen_cy), cursor::Show)?;
 
         stdout.flush()?;
+        Ok(())
+    }
+
+    fn draw_row_content(
+        &self,
+        stdout: &mut std::io::Stdout,
+        file_row: usize,
+        buffer_row: &crate::buffer::Row,
+        text_cols: usize,
+    ) -> Result<()> {
+        let Some(sel) = self.active_selection() else {
+            let render_text = buffer_row.slice_chars(self.col_offset, text_cols);
+            queue!(stdout, Print(render_text))?;
+            return Ok(());
+        };
+
+        let (start, end) = sel.ordered();
+        if file_row < start.row || file_row > end.row {
+            let render_text = buffer_row.slice_chars(self.col_offset, text_cols);
+            queue!(stdout, Print(render_text))?;
+            return Ok(());
+        }
+
+        let sel_start_cx = if file_row == start.row { start.col } else { 0 };
+        let sel_end_cx = if file_row == end.row {
+            end.col
+        } else {
+            buffer_row.len
+        };
+        let sel_start_rx = buffer_row.cx_to_rx(sel_start_cx);
+        let sel_end_rx = buffer_row.cx_to_rx(sel_end_cx);
+
+        if text_cols == 0 {
+            return Ok(());
+        }
+        let end_col = self.col_offset.saturating_add(text_cols);
+        let mut rx = 0;
+        let mut current_selected = false;
+
+        for c in buffer_row.render.chars() {
+            let w = char_display_width(c);
+            let next_rx = rx + w;
+            if next_rx <= self.col_offset {
+                rx = next_rx;
+                continue;
+            }
+            if next_rx > end_col {
+                break;
+            }
+            let is_sel = rx >= sel_start_rx && rx < sel_end_rx;
+            if is_sel != current_selected {
+                if is_sel {
+                    if let Some((r, g, b)) = self.config.theme.selection_bg {
+                        queue!(stdout, SetBackgroundColor(Color::Rgb { r, g, b }))?;
+                    } else {
+                        queue!(stdout, SetAttribute(Attribute::Reverse))?;
+                    }
+                    if let Some((r, g, b)) = self.config.theme.selection_fg {
+                        queue!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
+                    }
+                } else {
+                    queue!(stdout, SetAttribute(Attribute::NoReverse), ResetColor)?;
+                    self.apply_editor_theme(stdout)?;
+                }
+                current_selected = is_sel;
+            }
+            queue!(stdout, Print(c))?;
+            rx = next_rx;
+        }
+
+        if current_selected {
+            queue!(stdout, SetAttribute(Attribute::NoReverse), ResetColor)?;
+            self.apply_editor_theme(stdout)?;
+        }
         Ok(())
     }
 
@@ -1124,7 +1555,6 @@ impl Editor {
 
             if let Some(buffer_row) = self.buffer.get_row(file_row) {
                 let gutter = self.format_gutter_line(file_row);
-                let render_text = buffer_row.slice_chars(self.col_offset, text_cols);
                 queue!(
                     stdout,
                     SetAttribute(Attribute::Dim),
@@ -1132,7 +1562,7 @@ impl Editor {
                     SetAttribute(Attribute::Reset)
                 )?;
                 self.apply_editor_theme(stdout)?;
-                queue!(stdout, Print(render_text))?;
+                self.draw_row_content(stdout, file_row, buffer_row, text_cols)?;
             } else if self.buffer.is_empty() && file_row == 0 {
                 let gutter = self.format_gutter_line(0);
                 queue!(
@@ -1757,5 +2187,67 @@ mod tests {
         // Pressing 'n' cancels the sudo save prompt cleanly
         editor.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), 24);
         assert_eq!(editor.prompt, PromptState::None);
+    }
+
+    #[test]
+    fn shift_navigation_and_ctrl_a_create_selection_and_typing_replaces_atomically() {
+        let mut editor = Editor::new(Buffer::from_lines(&["hello world", "second line"]));
+
+        // Shift+Ctrl+Right selects "hello"
+        editor.handle_key_event(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            24,
+        );
+        assert_eq!(
+            editor.selection,
+            Some(Selection::new(Position::new(0, 0), Position::new(0, 5)))
+        );
+
+        // Unshifted Right collapses selection
+        editor.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), 24);
+        assert_eq!(editor.selection, None);
+
+        // Ctrl+A selects the entire buffer
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), 24);
+        assert_eq!(
+            editor.selection,
+            Some(Selection::new(Position::new(0, 0), Position::new(1, 11)))
+        );
+
+        // Typing 'X' replaces the entire selection in a single undo step
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE), 24);
+        assert_eq!(editor.buffer.contents(), "X");
+        assert_eq!(editor.selection, None);
+
+        // Single Ctrl+Z restores the full multi-line buffer
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.buffer.contents(), "hello world\nsecond line");
+    }
+
+    #[test]
+    fn copy_cut_paste_and_block_tab_indentation_work_with_selections() {
+        let mut editor = Editor::new(Buffer::from_lines(&["first", "second", "third"]));
+
+        // With no selection, Ctrl+C copies the current line ("first\n")
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.clipboard.get_text(), "first\n");
+
+        // Select lines 0 and 1 with Shift+Down and Shift+End, then press Tab to block-indent
+        editor.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), 24);
+        editor.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT), 24);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 24);
+        assert_eq!(editor.buffer.contents(), "    first\n    second\nthird");
+
+        // Shift+Tab block-unindents both selected lines
+        editor.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), 24);
+        assert_eq!(editor.buffer.contents(), "first\nsecond\nthird");
+
+        // Cut the selection ("first\nsecond") with Ctrl+X and paste at the end with Ctrl+V
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.buffer.contents(), "\nthird");
+        editor.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 24);
+        editor.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), 24);
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.buffer.contents(), "\nthirdfirst\nsecond");
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "omo"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A lightweight, one-mode-only terminal text editor."
 readme = "README.md"
@@ -11,6 +11,7 @@ categories = ["text-editors", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"
+arboard = "3.7.0"
 crossterm = "0.29.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.0"

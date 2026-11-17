@@ -68,6 +68,14 @@ zsh         = { tab_width = 4, expand_tabs = true }
 "ctrl+y"           = "redo"
 "alt+y"            = "redo"
 "ctrl+shift+z"     = "redo"
+"ctrl+c"           = "copy"
+"alt+c"            = "copy"
+"ctrl+x"           = "cut"
+"alt+x"            = "cut"
+"ctrl+v"           = "paste"
+"alt+v"            = "paste"
+"ctrl+a"           = "select_all"
+"alt+a"            = "select_all"
 "ctrl+d"           = "duplicate_line"
 "alt+d"            = "duplicate_line"
 "ctrl+shift+d"     = "delete_line"
@@ -239,6 +247,10 @@ pub struct ThemeConfig {
     pub status_bg: Option<(u8, u8, u8)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_fg: Option<(u8, u8, u8)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_bg: Option<(u8, u8, u8)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_fg: Option<(u8, u8, u8)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,12 +261,17 @@ pub enum Action {
     Undo,
     Redo,
     Find,
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
     DuplicateLine,
     DeleteLine,
     MoveLineUp,
     MoveLineDown,
     InsertLineBelow,
     InsertLineAbove,
+    Indent,
     Unindent,
     WordLeft,
     WordRight,
@@ -356,6 +373,14 @@ pub fn default_keys() -> HashMap<String, Vec<Action>> {
     bind("ctrl+y", Action::Redo);
     bind("alt+y", Action::Redo);
     bind("ctrl+shift+z", Action::Redo);
+    bind("ctrl+c", Action::Copy);
+    bind("alt+c", Action::Copy);
+    bind("ctrl+x", Action::Cut);
+    bind("alt+x", Action::Cut);
+    bind("ctrl+v", Action::Paste);
+    bind("alt+v", Action::Paste);
+    bind("ctrl+a", Action::SelectAll);
+    bind("alt+a", Action::SelectAll);
     bind("ctrl+f", Action::Find);
     bind("alt+f", Action::Find);
     bind("f3", Action::Find);

@@ -562,6 +562,66 @@ impl Row {
 
 const MAX_UNDO_HISTORY: usize = 200;
 
+/// Represents a 0-based `(row, col)` character position in a [`Buffer`].
+/// Ordering compares `row` first, then character `col`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Position {
+    pub row: usize,
+    pub col: usize,
+}
+
+impl Position {
+    pub fn new(row: usize, col: usize) -> Self {
+        Self { row, col }
+    }
+}
+
+/// Represents a text selection defined by an `anchor` and a moving cursor `head`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: Position,
+    pub head: Position,
+}
+
+impl Selection {
+    pub fn new(anchor: Position, head: Position) -> Self {
+        Self { anchor, head }
+    }
+
+    /// Returns `(start, end)` ordered so `start <= end`.
+    pub fn ordered(&self) -> (Position, Position) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Returns `true` if the selection spans zero characters.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// Returns `true` if character coordinate `(row, col)` lies within `[start, end)`.
+    #[allow(dead_code)]
+    pub fn contains(&self, row: usize, col: usize) -> bool {
+        let (start, end) = self.ordered();
+        let pos = Position { row, col };
+        pos >= start && pos < end
+    }
+
+    /// Returns the inclusive `(start_row, end_row)` range covered by this selection for
+    /// line-level block operations (ignoring a trailing row when `end.col == 0` on a multi-line selection).
+    pub fn line_range(&self) -> (usize, usize) {
+        let (start, end) = self.ordered();
+        if end.row > start.row && end.col == 0 {
+            (start.row, end.row - 1)
+        } else {
+            (start.row, end.row)
+        }
+    }
+}
+
 /// Detects whether an existing file path is read-only or not writable by the current process.
 pub fn detect_file_read_only(filename: &str) -> bool {
     let Ok(meta) = fs::metadata(filename) else {
@@ -1265,6 +1325,305 @@ impl Buffer {
         }
     }
 
+    /// Extracts the substring in `[start, end)` (ordered) joined by `\n`.
+    pub fn extract_range(&self, start: Position, end: Position) -> String {
+        if self.rows.is_empty() || start >= end {
+            return String::new();
+        }
+        let max_row = self.rows.len() - 1;
+        let s_row = start.row.min(max_row);
+        let e_row = end.row.min(max_row);
+        let s_col = start.col.min(self.rows[s_row].len);
+        let e_col = if end.row > max_row {
+            self.rows[max_row].len
+        } else {
+            end.col.min(self.rows[e_row].len)
+        };
+
+        if s_row == e_row {
+            return self.rows[s_row]
+                .buffer
+                .chars()
+                .skip(s_col)
+                .take(e_col.saturating_sub(s_col))
+                .collect();
+        }
+
+        let mut parts = Vec::with_capacity(e_row - s_row + 1);
+        parts.push(
+            self.rows[s_row]
+                .buffer
+                .chars()
+                .skip(s_col)
+                .collect::<String>(),
+        );
+        for r in (s_row + 1)..e_row {
+            parts.push(self.rows[r].text());
+        }
+        parts.push(
+            self.rows[e_row]
+                .buffer
+                .chars()
+                .take(e_col)
+                .collect::<String>(),
+        );
+        parts.join("\n")
+    }
+
+    /// Deletes the text in `[start, end)` without recording an undo snapshot, returning the normalized `start` position.
+    pub fn delete_range_no_snapshot(&mut self, start: Position, end: Position) -> Position {
+        if self.rows.is_empty() || start >= end {
+            return start;
+        }
+        let max_row = self.rows.len() - 1;
+        let s_row = start.row.min(max_row);
+        let e_row = end.row.min(max_row);
+        let s_col = start.col.min(self.rows[s_row].len);
+        let e_col = if end.row > max_row {
+            self.rows[max_row].len
+        } else {
+            end.col.min(self.rows[e_row].len)
+        };
+
+        if s_row == e_row {
+            let count = e_col.saturating_sub(s_col);
+            if count > 0 {
+                let row_mut = Arc::make_mut(&mut self.rows[s_row]);
+                for _ in 0..count {
+                    row_mut.delete_char(s_col);
+                }
+                self.dirty = true;
+            }
+        } else {
+            let tail = {
+                let mut end_clone = (*self.rows[e_row]).clone();
+                end_clone.split(e_col)
+            };
+            let start_mut = Arc::make_mut(&mut self.rows[s_row]);
+            let _ = start_mut.split(s_col);
+            start_mut.append(&tail);
+            self.rows.drain((s_row + 1)..=e_row);
+            self.dirty = true;
+        }
+
+        if self.rows.len() == 1 && self.rows[0].len == 0 {
+            self.rows.clear();
+        }
+        self.coalesce_insert_pos = None;
+        Position::new(s_row, s_col)
+    }
+
+    /// Records an undo snapshot at `(cursor_cx, cursor_cy)` and deletes the text in `[start, end)`.
+    pub fn delete_range(
+        &mut self,
+        start: Position,
+        end: Position,
+        cursor_cx: usize,
+        cursor_cy: usize,
+    ) -> Position {
+        if self.rows.is_empty() || start >= end {
+            return start;
+        }
+        self.record_snapshot(cursor_cx, cursor_cy);
+        self.delete_range_no_snapshot(start, end)
+    }
+
+    /// Inserts a potentially multi-line string at `(cx, cy)` without recording an undo snapshot,
+    /// returning the resulting `(new_cx, new_cy)` cursor coordinates.
+    pub fn insert_str_no_snapshot(&mut self, cx: usize, cy: usize, text: &str) -> (usize, usize) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return (cx, cy);
+        }
+        while self.rows.len() <= cy {
+            self.rows
+                .push(Arc::new(Row::with_tab_width("", self.tab_width)));
+        }
+
+        let lines: Vec<&str> = normalized.split('\n').collect();
+        let clamped_cx = cx.min(self.rows[cy].len);
+
+        if lines.len() == 1 {
+            let row_mut = Arc::make_mut(&mut self.rows[cy]);
+            let mut cur_cx = clamped_cx;
+            for c in lines[0].chars() {
+                row_mut.insert_char(cur_cx, c);
+                cur_cx += 1;
+            }
+            self.dirty = true;
+            self.coalesce_insert_pos = None;
+            return (cur_cx, cy);
+        }
+
+        let tail = Arc::make_mut(&mut self.rows[cy]).split(clamped_cx);
+        let first_piece = Row::with_tab_width(lines[0], self.tab_width);
+        Arc::make_mut(&mut self.rows[cy]).append(&first_piece);
+
+        let mut insert_at = cy + 1;
+        for &mid in &lines[1..lines.len() - 1] {
+            self.rows.insert(
+                insert_at,
+                Arc::new(Row::with_tab_width(mid, self.tab_width)),
+            );
+            insert_at += 1;
+        }
+
+        let last_piece = lines[lines.len() - 1];
+        let mut last_row = Row::with_tab_width(last_piece, self.tab_width);
+        let final_cx = last_row.len;
+        last_row.append(&tail);
+        self.rows.insert(insert_at, Arc::new(last_row));
+
+        self.dirty = true;
+        self.coalesce_insert_pos = None;
+        (final_cx, insert_at)
+    }
+
+    /// Records an undo snapshot at `(cx, cy)` and inserts `text` atomically.
+    pub fn insert_str(&mut self, cx: usize, cy: usize, text: &str) -> (usize, usize) {
+        if text.is_empty() {
+            return (cx, cy);
+        }
+        self.record_snapshot(cx, cy);
+        self.insert_str_no_snapshot(cx, cy, text)
+    }
+
+    /// Indents all lines in `start_row..=end_row` by one tab stop (`tab_width` spaces when
+    /// `expand_tabs` is `true`, or `'\t'` when `false`) in a single undo snapshot,
+    /// returning the updated `cursor_cx`.
+    pub fn indent_lines(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+        tab_width: usize,
+        expand_tabs: bool,
+        cursor_cx: usize,
+        cursor_cy: usize,
+    ) -> usize {
+        if self.rows.is_empty() || start_row >= self.rows.len() {
+            return cursor_cx;
+        }
+        let last_row = end_row.min(self.rows.len() - 1);
+        let prefix = if expand_tabs {
+            " ".repeat(tab_width.max(1))
+        } else {
+            "\t".to_string()
+        };
+        let prefix_chars: Vec<char> = prefix.chars().collect();
+        let added_len = prefix_chars.len();
+
+        self.record_snapshot(cursor_cx, cursor_cy);
+        let mut new_cursor_cx = cursor_cx;
+        for r in start_row..=last_row {
+            if start_row != last_row && self.rows[r].len == 0 {
+                continue;
+            }
+            let row_mut = Arc::make_mut(&mut self.rows[r]);
+            for (idx, &ch) in prefix_chars.iter().enumerate() {
+                row_mut.insert_char(idx, ch);
+            }
+            if r == cursor_cy {
+                new_cursor_cx += added_len;
+            }
+        }
+        self.dirty = true;
+        new_cursor_cx
+    }
+
+    /// Unindents all lines in `start_row..=end_row` by up to one tab stop in a single undo snapshot,
+    /// returning the updated `cursor_cx`.
+    pub fn unindent_lines(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+        cursor_cx: usize,
+        cursor_cy: usize,
+    ) -> usize {
+        if self.rows.is_empty() || start_row >= self.rows.len() {
+            return cursor_cx;
+        }
+        let last_row = end_row.min(self.rows.len() - 1);
+        let max_spaces = self.tab_width.max(1);
+
+        let mut removals = Vec::with_capacity(last_row - start_row + 1);
+        let mut any_removed = false;
+        for r in start_row..=last_row {
+            let count = match self.rows[r].buffer.chars().next() {
+                Some('\t') => 1,
+                Some(' ') => self.rows[r]
+                    .buffer
+                    .chars()
+                    .take(max_spaces)
+                    .take_while(|&c| c == ' ')
+                    .count(),
+                _ => 0,
+            };
+            if count > 0 {
+                any_removed = true;
+            }
+            removals.push((r, count));
+        }
+
+        if !any_removed {
+            return cursor_cx;
+        }
+
+        self.record_snapshot(cursor_cx, cursor_cy);
+        let mut new_cursor_cx = cursor_cx;
+        for (r, count) in removals {
+            if count > 0 {
+                let row_mut = Arc::make_mut(&mut self.rows[r]);
+                for _ in 0..count {
+                    row_mut.delete_char(0);
+                }
+                if r == cursor_cy {
+                    new_cursor_cx = new_cursor_cx.saturating_sub(count);
+                }
+            }
+        }
+        if self.rows.len() == 1 && self.rows[0].len == 0 {
+            self.rows.clear();
+        }
+        self.dirty = true;
+        new_cursor_cx
+    }
+
+    /// Moves the inclusive block of lines `start_row..=end_row` up by one row in a single undo step.
+    pub fn move_lines_up(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+        cursor_cx: usize,
+        cursor_cy: usize,
+    ) -> bool {
+        if start_row == 0 || end_row >= self.rows.len() || start_row > end_row {
+            return false;
+        }
+        self.record_snapshot(cursor_cx, cursor_cy);
+        let above = self.rows.remove(start_row - 1);
+        self.rows.insert(end_row, above);
+        self.dirty = true;
+        true
+    }
+
+    /// Moves the inclusive block of lines `start_row..=end_row` down by one row in a single undo step.
+    pub fn move_lines_down(
+        &mut self,
+        start_row: usize,
+        end_row: usize,
+        cursor_cx: usize,
+        cursor_cy: usize,
+    ) -> bool {
+        if end_row + 1 >= self.rows.len() || start_row > end_row {
+            return false;
+        }
+        self.record_snapshot(cursor_cx, cursor_cy);
+        let below = self.rows.remove(end_row + 1);
+        self.rows.insert(start_row, below);
+        self.dirty = true;
+        true
+    }
+
     /// Serializes the buffer rows joined by `\n`.
     #[allow(dead_code)]
     pub fn contents(&self) -> String {
@@ -1713,5 +2072,44 @@ mod tests {
             let _ = fs::set_permissions(&path, writable);
         }
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn selection_extract_delete_insert_and_block_indentation_work_atomically() {
+        let mut buf = Buffer::from_lines(&["alpha beta", "gamma delta", "epsilon"]);
+        let start = Position::new(0, 6);
+        let end = Position::new(1, 5);
+        assert_eq!(buf.extract_range(start, end), "beta\ngamma");
+
+        let pos = buf.delete_range(start, end, 5, 1);
+        assert_eq!(pos, Position::new(0, 6));
+        assert_eq!(buf.contents(), "alpha  delta\nepsilon");
+
+        // Undo restores the multi-line deletion in a single step
+        assert_eq!(buf.undo(6, 0), Some((5, 1)));
+        assert_eq!(buf.contents(), "alpha beta\ngamma delta\nepsilon");
+
+        // Multi-line insert_str and block indent/unindent
+        let (new_cx, new_cy) = buf.insert_str(5, 0, "\nmid1\nmid2");
+        assert_eq!((new_cx, new_cy), (4, 2));
+        assert_eq!(
+            buf.contents(),
+            "alpha\nmid1\nmid2 beta\ngamma delta\nepsilon"
+        );
+
+        let updated_cx = buf.indent_lines(1, 2, 2, true, 4, 2);
+        assert_eq!(updated_cx, 6);
+        assert_eq!(
+            buf.contents(),
+            "alpha\n  mid1\n  mid2 beta\ngamma delta\nepsilon"
+        );
+
+        buf.set_tab_width(2);
+        let unindented_cx = buf.unindent_lines(1, 2, 6, 2);
+        assert_eq!(unindented_cx, 4);
+        assert_eq!(
+            buf.contents(),
+            "alpha\nmid1\nmid2 beta\ngamma delta\nepsilon"
+        );
     }
 }
