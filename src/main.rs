@@ -1,4 +1,5 @@
 mod buffer;
+mod clipboard;
 mod config;
 mod editor;
 mod terminal;
