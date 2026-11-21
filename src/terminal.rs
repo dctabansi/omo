@@ -1,7 +1,10 @@
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     style::ResetColor,
     terminal::{
@@ -20,7 +23,13 @@ impl Terminal {
     pub fn initialize() -> Result<Self> {
         enable_raw_mode()?;
         let term = Self;
-        execute!(stdout(), EnterAlternateScreen, Clear(ClearType::All))?;
+        execute!(
+            stdout(),
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         let _ = execute!(
             stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
@@ -49,6 +58,8 @@ impl Terminal {
     {
         let _ = execute!(
             stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
             crossterm::style::Print("\x1b[>4;0m"),
             PopKeyboardEnhancementFlags
         );
@@ -58,7 +69,13 @@ impl Terminal {
         let result = f();
 
         enable_raw_mode()?;
-        let _ = execute!(stdout(), EnterAlternateScreen, Clear(ClearType::All));
+        let _ = execute!(
+            stdout(),
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            EnableMouseCapture,
+            EnableBracketedPaste
+        );
         let _ = execute!(
             stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
@@ -73,6 +90,8 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = execute!(
             stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
             crossterm::style::Print("\x1b[>4;0m"),
             PopKeyboardEnhancementFlags
         );

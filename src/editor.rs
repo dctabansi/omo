@@ -1,7 +1,10 @@
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    },
     queue,
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -9,6 +12,7 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use std::io::{Write, stdout};
+use std::time::Instant;
 
 use crate::buffer::{
     Buffer, Position, Selection, char_display_width, sanitize_render_char, str_display_width,
@@ -103,12 +107,17 @@ pub enum EditorCommand {
     Noop,
 }
 
+const DOUBLE_CLICK_MS: u128 = 450;
+const MOUSE_SCROLL_LINES: usize = 3;
+
 pub struct Editor {
     should_quit: bool,
     buffer: Buffer,
     pub config: Config,
     pub selection: Option<Selection>,
     pub clipboard: ClipboardManager,
+    last_click: Option<(Instant, Position, u8)>,
+    pub viewport_scrolled_by_mouse: bool,
     cx: usize,
     cy: usize,
     rx: usize,
@@ -143,6 +152,8 @@ impl Editor {
             config,
             selection: None,
             clipboard: ClipboardManager::new(),
+            last_click: None,
+            viewport_scrolled_by_mouse: false,
             cx: 0,
             cy: 0,
             rx: 0,
@@ -198,6 +209,11 @@ impl Editor {
         format!(" {:>width$} ", file_row + 1, width = digits)
     }
 
+    /// Returns the 0-based terminal screen row where the text viewport begins.
+    pub fn first_text_screen_row(&self) -> u16 {
+        0
+    }
+
     /// Computes the text viewport dimensions `(text_cols, text_rows)` after reserving the gutter
     /// and the bottom status bar row.
     pub fn text_viewport(&self, cols: u16, rows: u16) -> (usize, usize) {
@@ -206,15 +222,62 @@ impl Editor {
         (text_cols, text_rows)
     }
 
+    /// Returns `true` if the active cursor should be shown on screen for a viewport of `text_rows` lines.
+    /// When the user has scrolled the viewport away from `self.cy` with the mouse wheel (and no
+    /// bottom-bar prompt is active), the hardware cursor is hidden until the cursor re-enters view.
+    pub fn is_cursor_visible(&self, text_rows: usize) -> bool {
+        if matches!(
+            self.prompt,
+            PromptState::SaveAs { .. }
+                | PromptState::ConfirmSudoSave { .. }
+                | PromptState::GotoLine { .. }
+        ) {
+            return true;
+        }
+        let rows_bound = text_rows.max(1);
+        self.cy >= self.row_offset && self.cy < self.row_offset + rows_bound
+    }
+
+    /// Translates terminal screen coordinates `(screen_col, screen_row)` into buffer coordinates
+    /// `Position { row, col }`, returning `None` if the click occurred outside the text viewport.
+    /// Coordinates inside the line-number gutter (`screen_col < gutter_width`) clamp to column `0`.
+    pub fn screen_to_buffer_pos(
+        &self,
+        screen_col: u16,
+        screen_row: u16,
+        total_rows: u16,
+    ) -> Option<Position> {
+        let top = self.first_text_screen_row();
+        let (_, text_rows) = self.text_viewport(80, total_rows);
+        if screen_row < top || (screen_row - top) as usize >= text_rows {
+            return None;
+        }
+        if self.buffer.is_empty() {
+            return Some(Position::new(0, 0));
+        }
+
+        let rel_row = (screen_row - top) as usize;
+        let file_row = (self.row_offset + rel_row).min(self.buffer.len() - 1);
+        let gutter_w = self.gutter_width();
+        let cx = if (screen_col as usize) < gutter_w {
+            0
+        } else {
+            let target_rx = self.col_offset + (screen_col as usize - gutter_w);
+            self.buffer
+                .get_row(file_row)
+                .map_or(0, |row| row.rx_to_cx(target_rx))
+        };
+        Some(Position::new(file_row, cx))
+    }
+
     /// Computes the hardware cursor screen coordinates `(screen_cx, screen_cy)` using visual tab-expanded `rx`.
     pub fn cursor_screen_position(&self) -> (u16, u16) {
         let rx = self.visual_cx();
         let screen_cx = (self.gutter_width() + rx.saturating_sub(self.col_offset))
             .min(u16::MAX as usize) as u16;
-        let screen_cy = self
-            .cy
-            .saturating_sub(self.row_offset)
-            .min(u16::MAX as usize) as u16;
+        let screen_cy = (self.first_text_screen_row() as usize
+            + self.cy.saturating_sub(self.row_offset))
+        .min(u16::MAX as usize) as u16;
         (screen_cx, screen_cy)
     }
 
@@ -933,6 +996,200 @@ impl Editor {
         }
     }
 
+    fn snap_viewport_to_cursor(&mut self, viewport_rows: usize) {
+        self.viewport_scrolled_by_mouse = false;
+        if self.cy < self.row_offset {
+            self.row_offset = self.cy;
+        }
+        if viewport_rows > 0 && self.cy >= self.row_offset + viewport_rows {
+            self.row_offset = self.cy - viewport_rows + 1;
+        }
+    }
+
+    /// Handles a terminal bracketed paste event, normalizing line endings and inserting the
+    /// payload in a single atomic undo snapshot without auto-indent or `auto_pairs`.
+    pub fn handle_paste_event(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+
+        match self.prompt.clone() {
+            PromptState::SaveAs { mut input } => {
+                let first_line = normalized.lines().next().unwrap_or("");
+                input.push_str(first_line);
+                self.prompt = PromptState::SaveAs { input };
+                return;
+            }
+            PromptState::Search {
+                mut query,
+                saved_cx,
+                saved_cy,
+                case_sensitive,
+            } => {
+                let first_line = normalized.lines().next().unwrap_or("");
+                query.push_str(first_line);
+                if let Some((match_cx, match_cy)) =
+                    self.buffer
+                        .find_with_case(&query, saved_cx, saved_cy, true, case_sensitive)
+                {
+                    self.cx = match_cx;
+                    self.cy = match_cy;
+                    self.desired_cx = self.visual_cx();
+                } else {
+                    self.cx = saved_cx;
+                    self.cy = saved_cy;
+                    self.desired_cx = self.visual_cx();
+                }
+                self.prompt = PromptState::Search {
+                    query,
+                    saved_cx,
+                    saved_cy,
+                    case_sensitive,
+                };
+                return;
+            }
+            PromptState::GotoLine { mut input } => {
+                for c in normalized.chars().filter(char::is_ascii_digit) {
+                    input.push(c);
+                }
+                self.prompt = PromptState::GotoLine { input };
+                return;
+            }
+            PromptState::ConfirmSudoSave { .. } => return,
+            PromptState::None => {}
+        }
+
+        self.quit_confirm_pending = false;
+        self.status_message = None;
+        self.viewport_scrolled_by_mouse = false;
+        self.buffer.break_undo_coalesce();
+
+        if let Some(sel) = self.active_selection() {
+            let (start, end) = sel.ordered();
+            self.buffer.record_snapshot(self.cx, self.cy);
+            let pos = self.buffer.delete_range_no_snapshot(start, end);
+            self.selection = None;
+            let (new_cx, new_cy) =
+                self.buffer
+                    .insert_str_no_snapshot(pos.col, pos.row, &normalized);
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
+        } else {
+            let (new_cx, new_cy) = self.buffer.insert_str(self.cx, self.cy, &normalized);
+            self.cx = new_cx;
+            self.cy = new_cy;
+            self.desired_cx = self.visual_cx();
+        }
+    }
+
+    /// Processes a mouse event (`Down`, `Drag`, `ScrollUp`, `ScrollDown`) against the editor state.
+    pub fn handle_mouse_event(&mut self, mouse: MouseEvent, _cols: u16, rows: u16) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(pos) = self.screen_to_buffer_pos(mouse.column, mouse.row, rows) else {
+                    return;
+                };
+                self.quit_confirm_pending = false;
+                self.status_message = None;
+                self.viewport_scrolled_by_mouse = false;
+                self.buffer.break_undo_coalesce();
+
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    let anchor = self
+                        .selection
+                        .map_or(Position::new(self.cy, self.cx), |s| s.anchor);
+                    self.cy = pos.row;
+                    self.cx = pos.col;
+                    self.desired_cx = self.visual_cx();
+                    self.selection = if anchor == pos {
+                        None
+                    } else {
+                        Some(Selection::new(anchor, pos))
+                    };
+                    self.last_click = None;
+                    return;
+                }
+
+                let now = Instant::now();
+                let click_count = match self.last_click {
+                    Some((prev_time, prev_pos, count))
+                        if now.duration_since(prev_time).as_millis() <= DOUBLE_CLICK_MS
+                            && prev_pos.row == pos.row
+                            && (count == 2 || prev_pos.col == pos.col) =>
+                    {
+                        if count >= 3 {
+                            1
+                        } else {
+                            count + 1
+                        }
+                    }
+                    _ => 1,
+                };
+                self.last_click = Some((now, pos, click_count));
+
+                match click_count {
+                    1 => {
+                        self.selection = None;
+                        self.cy = pos.row;
+                        self.cx = pos.col;
+                        self.desired_cx = self.visual_cx();
+                    }
+                    2 => {
+                        let (w_start, w_end) = self.buffer.word_span_at(pos.col, pos.row);
+                        self.cy = pos.row;
+                        self.cx = w_end;
+                        self.desired_cx = self.visual_cx();
+                        let sel = Selection::new(
+                            Position::new(pos.row, w_start),
+                            Position::new(pos.row, w_end),
+                        );
+                        self.selection = if sel.is_empty() { None } else { Some(sel) };
+                    }
+                    _ => {
+                        let row_len = self.buffer.get_row(pos.row).map_or(0, |r| r.len);
+                        self.cy = pos.row;
+                        self.cx = row_len;
+                        self.desired_cx = self.visual_cx();
+                        let sel = Selection::new(
+                            Position::new(pos.row, 0),
+                            Position::new(pos.row, row_len),
+                        );
+                        self.selection = if sel.is_empty() { None } else { Some(sel) };
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(pos) = self.screen_to_buffer_pos(mouse.column, mouse.row, rows) else {
+                    return;
+                };
+                self.viewport_scrolled_by_mouse = false;
+                let anchor = self
+                    .selection
+                    .map_or(Position::new(self.cy, self.cx), |s| s.anchor);
+                self.cy = pos.row;
+                self.cx = pos.col;
+                self.desired_cx = self.visual_cx();
+                self.selection = if anchor == pos {
+                    None
+                } else {
+                    Some(Selection::new(anchor, pos))
+                };
+            }
+            MouseEventKind::ScrollUp => {
+                self.viewport_scrolled_by_mouse = true;
+                self.row_offset = self.row_offset.saturating_sub(MOUSE_SCROLL_LINES);
+            }
+            MouseEventKind::ScrollDown => {
+                self.viewport_scrolled_by_mouse = true;
+                let max_offset = self.buffer.len().saturating_sub(1);
+                self.row_offset = (self.row_offset + MOUSE_SCROLL_LINES).min(max_offset);
+            }
+            _ => {}
+        }
+    }
+
     fn trigger_word_left_raw(&mut self) {
         self.buffer.break_undo_coalesce();
         let (new_cx, new_cy) = self.buffer.word_boundary_left(self.cx, self.cy);
@@ -1405,6 +1662,7 @@ impl Editor {
                     break;
                 }
             }
+            self.snap_viewport_to_cursor(viewport_rows);
             return;
         }
 
@@ -1420,18 +1678,36 @@ impl Editor {
         match command {
             EditorCommand::Action(action) => {
                 self.execute_action(action);
+                self.snap_viewport_to_cursor(viewport_rows);
             }
             EditorCommand::Move { code, select } => {
-                self.move_cursor_with_selection(code, viewport_rows, select)
+                self.move_cursor_with_selection(code, viewport_rows, select);
+                self.snap_viewport_to_cursor(viewport_rows);
             }
             EditorCommand::MoveWord { forward, select } => {
-                self.move_word_with_selection(forward, select)
+                self.move_word_with_selection(forward, select);
+                self.snap_viewport_to_cursor(viewport_rows);
             }
-            EditorCommand::InsertChar(c) => self.insert_char(c),
-            EditorCommand::InsertNewline => self.insert_newline(),
-            EditorCommand::Backspace => self.backspace(),
-            EditorCommand::Delete => self.delete_forward(),
-            EditorCommand::InsertTab => self.insert_tab(),
+            EditorCommand::InsertChar(c) => {
+                self.insert_char(c);
+                self.snap_viewport_to_cursor(viewport_rows);
+            }
+            EditorCommand::InsertNewline => {
+                self.insert_newline();
+                self.snap_viewport_to_cursor(viewport_rows);
+            }
+            EditorCommand::Backspace => {
+                self.backspace();
+                self.snap_viewport_to_cursor(viewport_rows);
+            }
+            EditorCommand::Delete => {
+                self.delete_forward();
+                self.snap_viewport_to_cursor(viewport_rows);
+            }
+            EditorCommand::InsertTab => {
+                self.insert_tab();
+                self.snap_viewport_to_cursor(viewport_rows);
+            }
             EditorCommand::Noop => {}
         }
     }
@@ -1451,7 +1727,9 @@ impl Editor {
     fn refresh_screen(&mut self) -> Result<()> {
         let (cols, rows) = Terminal::size()?;
         let (text_cols, text_rows) = self.text_viewport(cols, rows);
-        self.scroll(text_cols, text_rows);
+        if !self.viewport_scrolled_by_mouse {
+            self.scroll(text_cols, text_rows);
+        }
 
         let mut stdout = stdout();
 
@@ -1463,8 +1741,10 @@ impl Editor {
         self.draw_rows(&mut stdout, cols, rows)?;
         self.draw_status_bar(&mut stdout, cols)?;
 
-        let (screen_cx, screen_cy) = self.active_cursor_screen_position(cols, rows);
-        queue!(stdout, cursor::MoveTo(screen_cx, screen_cy), cursor::Show)?;
+        if self.is_cursor_visible(text_rows) {
+            let (screen_cx, screen_cy) = self.active_cursor_screen_position(cols, rows);
+            queue!(stdout, cursor::MoveTo(screen_cx, screen_cy), cursor::Show)?;
+        }
 
         stdout.flush()?;
         Ok(())
@@ -1619,10 +1899,34 @@ impl Editor {
 
     /// Blocks and waits for user input.
     fn process_keypress(&mut self) -> Result<()> {
-        if let Event::Key(key) = event::read()? {
-            let (_, rows) = Terminal::size().unwrap_or((80, 24));
-            let text_rows = (rows as usize).saturating_sub(1);
-            self.handle_key_event(key, text_rows);
+        loop {
+            match event::read()? {
+                Event::Key(key) => {
+                    let (cols, rows) = Terminal::size().unwrap_or((80, 24));
+                    let (_, text_rows) = self.text_viewport(cols, rows);
+                    self.handle_key_event(key, text_rows);
+                    break;
+                }
+                Event::Mouse(mouse) => {
+                    if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
+                        continue;
+                    }
+                    let (cols, rows) = Terminal::size().unwrap_or((80, 24));
+                    self.handle_mouse_event(mouse, cols, rows);
+                    break;
+                }
+                Event::Paste(text) => {
+                    let (cols, rows) = Terminal::size().unwrap_or((80, 24));
+                    let (_, text_rows) = self.text_viewport(cols, rows);
+                    self.handle_paste_event(&text);
+                    self.snap_viewport_to_cursor(text_rows);
+                    break;
+                }
+                Event::Resize(_, _) => {
+                    break;
+                }
+                _ => continue,
+            }
         }
         Ok(())
     }
@@ -2249,5 +2553,121 @@ mod tests {
         editor.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), 24);
         editor.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL), 24);
         assert_eq!(editor.buffer.contents(), "\nthirdfirst\nsecond");
+    }
+
+    #[test]
+    fn mouse_click_drag_gutter_clamping_and_multi_click_selection() {
+        let mut editor = Editor::new(Buffer::from_lines(&["hello world", "second line"]));
+        // Gutter width for 2 lines is 3 (" 1 ")
+        assert_eq!(editor.gutter_width(), 3);
+
+        // Clicking inside the gutter (column 1, row 1) clamps to cx = 0 on row 1
+        editor.handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            80,
+            24,
+        );
+        assert_eq!((editor.cx, editor.cy), (0, 1));
+
+        // Single click at screen column 3 + 2 = 5 on row 0 ("he|llo world"), then double-click selects "hello", triple-click selects entire line
+        let click_row0 = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        editor.handle_mouse_event(click_row0, 80, 24);
+        assert_eq!((editor.cx, editor.cy), (2, 0));
+        assert_eq!(editor.selection, None);
+
+        editor.handle_mouse_event(click_row0, 80, 24);
+        assert_eq!(
+            editor.selection,
+            Some(Selection::new(Position::new(0, 0), Position::new(0, 5)))
+        );
+
+        editor.handle_mouse_event(click_row0, 80, 24);
+        assert_eq!(
+            editor.selection,
+            Some(Selection::new(Position::new(0, 0), Position::new(0, 11)))
+        );
+
+        // Dragging from (0, 2) into the gutter on row 1 clamps end.col to 0
+        editor.last_click = None;
+        editor.handle_mouse_event(click_row0, 80, 24);
+        editor.handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 0,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            80,
+            24,
+        );
+        assert_eq!(
+            editor.selection,
+            Some(Selection::new(Position::new(0, 2), Position::new(1, 0)))
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_viewport_without_moving_cursor_or_clearing_selection_and_snaps_back() {
+        let mut lines = Vec::new();
+        for i in 0..20 {
+            lines.push(format!("line {i}"));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut editor = Editor::new(Buffer::from_lines(&refs));
+
+        // Select "line" on row 0
+        editor.handle_key_event(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            5,
+        );
+        let original_selection = editor.selection;
+        assert_eq!((editor.cx, editor.cy, editor.row_offset), (4, 0, 0));
+        assert!(editor.is_cursor_visible(5));
+
+        // Scroll down with mouse wheel twice (6 rows total): row_offset becomes 6, cursor stays at (4, 0) and selection is preserved
+        for _ in 0..2 {
+            editor.handle_mouse_event(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 5,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+                80,
+                6,
+            );
+        }
+        assert_eq!(editor.row_offset, 6);
+        assert_eq!((editor.cx, editor.cy), (4, 0));
+        assert_eq!(editor.selection, original_selection);
+        assert!(!editor.is_cursor_visible(5));
+
+        // Pressing Right arrow collapses selection, moves cursor to (5, 0), and snaps row_offset back to 0
+        editor.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), 5);
+        assert_eq!((editor.cx, editor.cy, editor.row_offset), (5, 0, 0));
+        assert!(editor.is_cursor_visible(5));
+    }
+
+    #[test]
+    fn bracketed_paste_normalizes_crlf_and_inserts_without_auto_pairs_in_single_undo() {
+        let mut editor = Editor::new(Buffer::from_lines(&["    start"]));
+        editor.move_cursor(KeyCode::End, 24);
+
+        editor.handle_paste_event("(\r\nnext_line");
+        assert_eq!(editor.buffer.contents(), "    start(\nnext_line");
+
+        // Single Ctrl+Z reverts the entire multi-line paste
+        editor.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL), 24);
+        assert_eq!(editor.buffer.contents(), "    start");
     }
 }

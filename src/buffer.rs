@@ -1172,6 +1172,28 @@ impl Buffer {
         (idx, clamped_cy)
     }
 
+    /// Returns the `(start_cx, end_cx)` character range of the word or token under `(cx, cy)`.
+    pub fn word_span_at(&self, cx: usize, cy: usize) -> (usize, usize) {
+        let Some(row) = self.rows.get(cy) else {
+            return (0, 0);
+        };
+        let chars: Vec<char> = row.buffer.chars().collect();
+        if chars.is_empty() {
+            return (0, 0);
+        }
+        let pivot = cx.min(chars.len() - 1);
+        let class = classify_char(chars[pivot]);
+        let mut start = pivot;
+        while start > 0 && classify_char(chars[start - 1]) == class {
+            start -= 1;
+        }
+        let mut end = pivot + 1;
+        while end < chars.len() && classify_char(chars[end]) == class {
+            end += 1;
+        }
+        (start, end)
+    }
+
     /// Deletes from `(cx, cy)` back to the previous word boundary, returning the new `(cx, cy)`.
     pub fn delete_word_left(&mut self, cx: usize, cy: usize) -> Option<(usize, usize)> {
         if cy >= self.rows.len() {
